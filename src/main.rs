@@ -54,6 +54,9 @@ enum Command {
         /// Target endpoint (repeatable)
         #[arg(long = "target", required = true)]
         targets: Vec<String>,
+        /// Initial volume for a target device (repeatable, default 100)
+        #[arg(long = "volume", value_name = "DEV=PERCENT")]
+        volumes: Vec<String>,
         /// Stop automatically after this many seconds
         #[arg(long)]
         seconds: Option<u64>,
@@ -63,6 +66,9 @@ enum Command {
         /// Target endpoint (repeatable)
         #[arg(long = "target", required = true)]
         targets: Vec<String>,
+        /// Initial volume for a target device (repeatable, default 100)
+        #[arg(long = "volume", value_name = "DEV=PERCENT")]
+        volumes: Vec<String>,
         /// Stop automatically after this many seconds
         #[arg(long)]
         seconds: Option<u64>,
@@ -95,11 +101,13 @@ fn run(cli: Cli) -> Result<()> {
         Command::Play {
             source,
             targets,
+            volumes,
             seconds,
         } => {
             let devices = enumerate()?;
             let source = resolve_source(source.as_deref(), &devices)?;
             let targets = resolve_targets(&targets, &devices)?;
+            apply_volume_args(&volumes, &targets, &devices)?;
             for target in &targets {
                 if target.id == source.id {
                     bail!(
@@ -120,9 +128,14 @@ fn run(cli: Cli) -> Result<()> {
                 seconds,
             )
         }
-        Command::TestTone { targets, seconds } => {
+        Command::TestTone {
+            targets,
+            volumes,
+            seconds,
+        } => {
             let devices = enumerate()?;
             let targets = resolve_targets(&targets, &devices)?;
+            apply_volume_args(&volumes, &targets, &devices)?;
             print_targets(&targets);
             engine::run(engine::Source::Tone, targets, seconds)
         }
@@ -189,14 +202,41 @@ fn resolve_targets(selectors: &[String], devices: &[DeviceInfo]) -> Result<Vec<e
         targets.push(engine::Target {
             id: device.id.clone(),
             name: device.name.clone(),
+            volume: engine::Volume::new(100),
         });
     }
     Ok(targets)
 }
 
+/// Applies `--volume <DEV>=<PERCENT>` arguments; the device part accepts the
+/// same selectors as `--target` and must name one of the chosen targets.
+fn apply_volume_args(
+    volume_args: &[String],
+    targets: &[engine::Target],
+    devices: &[DeviceInfo],
+) -> Result<()> {
+    for arg in volume_args {
+        let (selector, percent) = arg
+            .rsplit_once('=')
+            .with_context(|| format!("--volume '{arg}' must have the form <device>=<percent>"))?;
+        let percent: u8 = percent
+            .parse()
+            .ok()
+            .filter(|p| *p <= 100)
+            .with_context(|| format!("--volume '{arg}': percent must be between 0 and 100"))?;
+        let device = resolve_device(selector, devices)?;
+        let target = targets
+            .iter()
+            .find(|t| t.id == device.id)
+            .with_context(|| format!("--volume device '{}' is not a target", device.name))?;
+        target.volume.set_percent(percent);
+    }
+    Ok(())
+}
+
 fn print_targets(targets: &[engine::Target]) {
     println!("Targets:");
     for target in targets {
-        println!("  - {}", target.name);
+        println!("  - {} (volume {}%)", target.name, target.volume.percent());
     }
 }

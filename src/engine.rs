@@ -6,7 +6,7 @@
 //! devices keep running. A failing source stops the whole engine.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,9 +33,42 @@ pub enum Source {
     Tone,
 }
 
+/// Shared per-device volume: the control side sets a target gain, the render
+/// thread ramps its applied gain toward it (see `render::apply_gain`).
+///
+/// v1 maps percent linearly to gain (0..100 -> 0.0..1.0); a perceptual dB
+/// mapping is deferred to the GUI phase.
+pub struct Volume {
+    gain_bits: AtomicU32,
+}
+
+impl Volume {
+    pub fn new(percent: u8) -> Arc<Self> {
+        let volume = Arc::new(Self {
+            gain_bits: AtomicU32::new(0),
+        });
+        volume.set_percent(percent);
+        volume
+    }
+
+    pub fn set_percent(&self, percent: u8) {
+        let gain = f32::from(percent.min(100)) / 100.0;
+        self.gain_bits.store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn gain(&self) -> f32 {
+        f32::from_bits(self.gain_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn percent(&self) -> u8 {
+        (self.gain() * 100.0).round() as u8
+    }
+}
+
 pub struct Target {
     pub id: String,
     pub name: String,
+    pub volume: Arc<Volume>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -70,6 +103,7 @@ impl EngineState {
 /// status loop.
 pub struct DeviceStats {
     pub name: String,
+    volume: Arc<Volume>,
     state: AtomicU8,
     underruns: AtomicU64,
     overruns: AtomicU64,
@@ -78,9 +112,10 @@ pub struct DeviceStats {
 }
 
 impl DeviceStats {
-    fn new(name: String) -> Self {
+    fn new(name: String, volume: Arc<Volume>) -> Self {
         Self {
             name,
+            volume,
             state: AtomicU8::new(EngineState::Starting as u8),
             underruns: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
@@ -109,11 +144,12 @@ impl DeviceStats {
         self.drift_ppm.store(ppm, Ordering::Relaxed);
     }
 
-    fn status_line(&self) -> String {
+    fn status_line(&self, index: usize) -> String {
         format!(
-            "  [{}] state={} fill={}ms drift={:+}ppm underruns={} overruns={}",
+            "  [{index}] {}: state={} vol={}% fill={}ms drift={:+}ppm underruns={} overruns={}",
             self.name,
             EngineState::from_u8(self.state.load(Ordering::Relaxed)).as_str(),
+            self.volume.percent(),
             self.fill_ms.load(Ordering::Relaxed),
             self.drift_ppm.load(Ordering::Relaxed),
             self.underruns.load(Ordering::Relaxed),
@@ -136,12 +172,16 @@ pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result
     let mut stats_list = Vec::new();
     let mut render_handles = Vec::new();
     for target in &targets {
-        let stats = Arc::new(DeviceStats::new(target.name.clone()));
+        let stats = Arc::new(DeviceStats::new(
+            target.name.clone(),
+            Arc::clone(&target.volume),
+        ));
         stats_list.push(Arc::clone(&stats));
         let params = RenderParams {
             device_id: target.id.clone(),
             source_rate,
             target_fill_frames,
+            volume: Arc::clone(&target.volume),
             stats: Arc::clone(&stats),
         };
         let reader = ring.reader();
@@ -180,16 +220,17 @@ pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result
             .context("spawning source thread")?
     };
 
-    println!("Engine running. Press Enter to stop.");
+    println!("Engine running.");
+    println!("Commands: 'v <target#> <0-100>' sets a device volume, Enter or 'q' stops.");
     {
         let stop = Arc::clone(&stop);
+        let volumes: Vec<(String, Arc<Volume>)> = targets
+            .iter()
+            .map(|t| (t.name.clone(), Arc::clone(&t.volume)))
+            .collect();
         // Detached on purpose: read_line cannot be interrupted, the thread
         // ends with the process.
-        thread::spawn(move || {
-            let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
-            stop.store(true, Ordering::Relaxed);
-        });
+        thread::spawn(move || command_loop(&volumes, &stop));
     }
 
     let started = Instant::now();
@@ -204,9 +245,7 @@ pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result
         if last_status.elapsed() >= STATUS_INTERVAL {
             last_status = Instant::now();
             println!("status after {} s:", started.elapsed().as_secs());
-            for stats in &stats_list {
-                println!("{}", stats.status_line());
-            }
+            print_status(&stats_list);
         }
     }
     stop.store(true, Ordering::Relaxed);
@@ -217,10 +256,62 @@ pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result
     let _ = source_handle.join();
 
     println!("final status:");
-    for stats in &stats_list {
-        println!("{}", stats.status_line());
-    }
+    print_status(&stats_list);
     Ok(())
+}
+
+fn print_status(stats_list: &[Arc<DeviceStats>]) {
+    for (index, stats) in stats_list.iter().enumerate() {
+        println!("{}", stats.status_line(index));
+    }
+}
+
+/// Minimal runtime control channel over stdin; the same command set will be
+/// driven by the GUI through a proper channel interface in a later phase.
+fn command_loop(volumes: &[(String, Arc<Volume>)], stop: &AtomicBool) {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    while !stop.load(Ordering::Relaxed) {
+        line.clear();
+        if stdin.read_line(&mut line).unwrap_or(0) == 0 {
+            // EOF: no interactive control available; keep the engine running.
+            return;
+        }
+        let command = line.trim();
+        if command.is_empty() || command.eq_ignore_ascii_case("q") {
+            stop.store(true, Ordering::Relaxed);
+            return;
+        }
+        match parse_volume_command(command, volumes.len()) {
+            Ok((index, percent)) => {
+                let (name, volume) = &volumes[index];
+                volume.set_percent(percent);
+                println!("volume of [{index}] {name} set to {percent}%");
+            }
+            Err(reason) => println!("{reason} (usage: 'v <target#> <0-100>', Enter or 'q' stops)"),
+        }
+    }
+}
+
+fn parse_volume_command(command: &str, target_count: usize) -> Result<(usize, u8), String> {
+    let mut parts = command.split_ascii_whitespace();
+    if parts.next() != Some("v") {
+        return Err(format!("unknown command '{command}'"));
+    }
+    let index = parts
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|i| *i < target_count)
+        .ok_or_else(|| format!("expected a target index between 0 and {}", target_count - 1))?;
+    let percent = parts
+        .next()
+        .and_then(|s| s.parse::<u8>().ok())
+        .filter(|p| *p <= 100)
+        .ok_or_else(|| "expected a volume between 0 and 100".to_string())?;
+    if parts.next().is_some() {
+        return Err("too many arguments".to_string());
+    }
+    Ok((index, percent))
 }
 
 fn run_loopback_source(

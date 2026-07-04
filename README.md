@@ -20,12 +20,13 @@ roadmap):
   file (verification tool)
 - `play` - capture a source endpoint and play it on one or more
   target devices simultaneously, with per-device clock-drift
-  compensation (see [docs/drift.md](docs/drift.md))
+  compensation (see [docs/drift.md](docs/drift.md)) and per-device
+  volume (adjustable at runtime, click-free ramping)
 - `test-tone` - play a periodic click pattern on multiple devices to
   measure their relative drift
 
-Not yet implemented: per-device volume, GUI, config persistence,
-hot-plug handling. See [PLAN.md](PLAN.md) for the full roadmap.
+Not yet implemented: GUI, config persistence, hot-plug handling.
+See [PLAN.md](PLAN.md) for the full roadmap.
 
 ## Requirements
 
@@ -47,6 +48,7 @@ be delayed, so the copies will audibly lag behind it (echo limitation).
 audio-multiplexer list
 audio-multiplexer record [--source <DEV>] [--seconds 10] [--out capture.wav]
 audio-multiplexer play [--source <DEV>] --target <DEV> [--target <DEV> ...]
+                       [--volume <DEV>=<0-100> ...]
 audio-multiplexer test-tone --target <DEV> --target <DEV> [--seconds N]
 ```
 
@@ -54,8 +56,12 @@ audio-multiplexer test-tone --target <DEV> --target <DEV> [--seconds N]
 name. `--source` defaults to the Windows default render device (set
 your silent virtual device as default so applications play into it).
 The engine prints a status line per device every 5 seconds (buffer
-fill, applied drift correction, underruns); stop it with Enter or
-`--seconds`.
+fill, volume, applied drift correction, underruns); stop it with
+Enter or `--seconds`.
+
+While the engine runs, volumes can be changed per device without
+clicks (short gain ramp): type `v <target#> <0-100>` and press Enter,
+where `<target#>` is the index shown in the status lines.
 
 Notes:
 

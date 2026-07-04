@@ -28,7 +28,7 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::com::ComGuard;
 use crate::devices::{self, StreamSampleKind};
-use crate::engine::{DeviceStats, EngineState};
+use crate::engine::{DeviceStats, EngineState, Volume};
 use crate::ring::{CHANNELS, ReadError, Reader};
 
 /// Allowed adjustment range of the resampling ratio at construction time.
@@ -52,10 +52,15 @@ const CORRECTION_LIMIT: f64 = 0.02;
 /// Smoothing factor for the fill-level EMA, applied once per render pass.
 const FILL_EMA_ALPHA: f64 = 0.1;
 
+/// Volume ramp time from gain 0.0 to 1.0. Ramping the gain instead of
+/// switching it instantly avoids zipper noise and clicks.
+const GAIN_RAMP_SECONDS: f32 = 0.010;
+
 pub struct RenderParams {
     pub device_id: String,
     pub source_rate: u32,
     pub target_fill_frames: u64,
+    pub volume: Arc<Volume>,
     pub stats: Arc<DeviceStats>,
 }
 
@@ -124,6 +129,10 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
     let mut rebuffering = true;
     stats.set_state(EngineState::Rebuffering);
 
+    // Per-frame gain step so a full 0.0 -> 1.0 change takes GAIN_RAMP_SECONDS.
+    let gain_step = 1.0 / (GAIN_RAMP_SECONDS * device_rate as f32);
+    let mut current_gain = params.volume.gain();
+
     while !stop.load(Ordering::Relaxed) {
         let wait = unsafe { WaitForSingleObject(event.0, 2000) };
         if stop.load(Ordering::Relaxed) {
@@ -187,6 +196,13 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
             .process_into_buffer(&input, &mut output, None)
             .map_err(|e| anyhow!("resampler: {e}"))?;
 
+        apply_gain(
+            &mut out_buf[..produced * CHANNELS],
+            &mut current_gain,
+            params.volume.gain(),
+            gain_step,
+        );
+
         unsafe {
             let dst = render.GetBuffer(frames_out)?;
             write_device_frames(dst, produced, device_channels, kind, &out_buf);
@@ -208,6 +224,23 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
 
     unsafe { handle.client.Stop()? };
     Ok(())
+}
+
+/// Applies the volume gain to interleaved canonical frames, ramping the
+/// applied gain toward `target` by at most `step` per frame to avoid zipper
+/// noise on volume changes.
+fn apply_gain(samples: &mut [f32], current: &mut f32, target: f32, step: f32) {
+    if *current == target && target == 1.0 {
+        return;
+    }
+    for frame in samples.chunks_exact_mut(CHANNELS) {
+        if *current != target {
+            *current += (target - *current).clamp(-step, step);
+        }
+        for sample in frame {
+            *sample *= *current;
+        }
+    }
 }
 
 fn write_silence(render: &IAudioRenderClient, frames: u32) -> Result<()> {
@@ -308,5 +341,49 @@ impl DriftController {
         let correction =
             (GAIN_P * error + self.integral).clamp(-CORRECTION_LIMIT, CORRECTION_LIMIT);
         Some(correction)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steady_full_gain_leaves_samples_untouched() {
+        let mut samples = vec![0.25f32; 8];
+        let mut current = 1.0f32;
+        apply_gain(&mut samples, &mut current, 1.0, 0.01);
+        assert_eq!(samples, vec![0.25f32; 8]);
+    }
+
+    #[test]
+    fn gain_ramps_toward_target_without_overshoot() {
+        let mut samples = vec![1.0f32; 20];
+        let mut current = 0.0f32;
+        apply_gain(&mut samples, &mut current, 1.0, 0.25);
+        // Each frame steps by at most 0.25 and never exceeds the target.
+        let per_frame: Vec<f32> = samples.chunks_exact(CHANNELS).map(|f| f[0]).collect();
+        assert_eq!(per_frame[0], 0.25);
+        assert_eq!(per_frame[1], 0.5);
+        assert!(per_frame.windows(2).all(|w| w[1] >= w[0]));
+        assert!(per_frame.iter().all(|&g| g <= 1.0));
+        assert_eq!(current, 1.0);
+    }
+
+    #[test]
+    fn both_channels_of_a_frame_get_the_same_gain() {
+        let mut samples = vec![1.0f32; 4];
+        let mut current = 0.0f32;
+        apply_gain(&mut samples, &mut current, 1.0, 0.5);
+        assert_eq!(samples, vec![0.5, 0.5, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn zero_volume_silences_after_the_ramp() {
+        let mut samples = vec![1.0f32; 100];
+        let mut current = 1.0f32;
+        apply_gain(&mut samples, &mut current, 0.0, 0.1);
+        assert_eq!(current, 0.0);
+        assert_eq!(samples[samples.len() - 1], 0.0);
     }
 }
