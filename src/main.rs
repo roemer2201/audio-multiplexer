@@ -3,8 +3,11 @@ compile_error!("audio-multiplexer only supports Windows (WASAPI / Core Audio API
 
 mod capture;
 mod com;
+mod config;
 mod devices;
 mod engine;
+mod gui;
+mod hotplug;
 mod render;
 mod ring;
 mod tone;
@@ -24,12 +27,15 @@ use crate::devices::DeviceInfo;
     about = "Plays Windows system audio on multiple output devices simultaneously and in sync"
 )]
 struct Cli {
+    /// Without a subcommand the graphical interface is started.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Start the graphical interface (the default when no command is given)
+    Gui,
     /// List all active audio render endpoints
     List,
     /// Record the loopback stream of a render endpoint into a WAV file
@@ -51,8 +57,9 @@ enum Command {
         /// defaults to the default render device
         #[arg(long)]
         source: Option<String>,
-        /// Target endpoint (repeatable)
-        #[arg(long = "target", required = true)]
+        /// Target endpoint (repeatable); without any --target the saved
+        /// configuration from the last run is restored
+        #[arg(long = "target")]
         targets: Vec<String>,
         /// Initial volume for a target device (repeatable, default 100)
         #[arg(long = "volume", value_name = "DEV=PERCENT")]
@@ -87,58 +94,141 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::List => cmd_list(),
-        Command::Record {
+        None | Some(Command::Gui) => gui::run_gui(),
+        Some(Command::List) => cmd_list(),
+        Some(Command::Record {
             source,
             seconds,
             out,
-        } => {
+        }) => {
             let devices = enumerate()?;
             let source = resolve_source(source.as_deref(), &devices)?;
             println!("Source: {}", source.name);
             capture::record_to_wav(&source.id, seconds, &out)
         }
-        Command::Play {
+        Some(Command::Play {
             source,
             targets,
             volumes,
             seconds,
-        } => {
-            let devices = enumerate()?;
-            let source = resolve_source(source.as_deref(), &devices)?;
-            let targets = resolve_targets(&targets, &devices)?;
-            apply_volume_args(&volumes, &targets, &devices)?;
-            for target in &targets {
-                if target.id == source.id {
-                    bail!(
-                        "target '{}' is the loopback source; playing onto the captured \
-                         endpoint would create a feedback loop",
-                        target.name
-                    );
-                }
-            }
-            println!("Source: {} ({})", source.name, source.mix_format);
-            print_targets(&targets);
-            engine::run(
-                engine::Source::Loopback {
-                    device_id: source.id.clone(),
-                    sample_rate: source.mix_format.sample_rate,
-                },
-                targets,
-                seconds,
-            )
-        }
-        Command::TestTone {
+        }) => cmd_play(source, targets, volumes, seconds),
+        Some(Command::TestTone {
             targets,
             volumes,
             seconds,
-        } => {
+        }) => {
             let devices = enumerate()?;
             let targets = resolve_targets(&targets, &devices)?;
             apply_volume_args(&volumes, &targets, &devices)?;
             print_targets(&targets);
             engine::run(engine::Source::Tone, targets, seconds)
         }
+    }
+}
+
+fn cmd_play(
+    source_arg: Option<String>,
+    target_args: Vec<String>,
+    volume_args: Vec<String>,
+    seconds: Option<u64>,
+) -> Result<()> {
+    let devices = enumerate()?;
+    let (source, targets) = if target_args.is_empty() {
+        restore_session(source_arg.as_deref(), &devices)?
+    } else {
+        let source = resolve_source(source_arg.as_deref(), &devices)?.clone();
+        let targets = resolve_targets(&target_args, &devices)?;
+        apply_volume_args(&volume_args, &targets, &devices)?;
+        for target in &targets {
+            if target.id == source.id {
+                bail!(
+                    "target '{}' is the loopback source; playing onto the captured \
+                     endpoint would create a feedback loop",
+                    target.name
+                );
+            }
+        }
+        persist_session(source_arg.is_some().then(|| source.id.clone()), &targets);
+        (source, targets)
+    };
+    println!("Source: {} ({})", source.name, source.mix_format);
+    print_targets(&targets);
+    engine::run(
+        engine::Source::Loopback {
+            device_id: source.id.clone(),
+            sample_rate: source.mix_format.sample_rate,
+        },
+        targets,
+        seconds,
+    )
+}
+
+/// `play` without --target: rebuild source and targets from the saved
+/// configuration. Stale (unplugged) targets are skipped with a warning but
+/// stay in the config file.
+fn restore_session(
+    source_arg: Option<&str>,
+    devices: &[DeviceInfo],
+) -> Result<(DeviceInfo, Vec<engine::Target>)> {
+    let saved = config::load()?;
+    if saved.targets.is_empty() {
+        bail!(
+            "no --target given and no saved configuration found ({}); \
+             specify at least one --target",
+            config::config_path()?.display()
+        );
+    }
+    let source_selector = source_arg.or(saved.source.as_deref());
+    let source = resolve_source(source_selector, devices)?.clone();
+    let mut targets = Vec::new();
+    for entry in &saved.targets {
+        let display_name = if entry.name.is_empty() {
+            &entry.id
+        } else {
+            &entry.name
+        };
+        match devices.iter().find(|d| d.id == entry.id) {
+            Some(device) if device.id == source.id => {
+                eprintln!("warning: skipping saved target '{display_name}' (loopback source)");
+            }
+            Some(device) => targets.push(engine::Target {
+                id: device.id.clone(),
+                name: device.name.clone(),
+                volume: engine::Volume::new(entry.volume),
+            }),
+            None => {
+                eprintln!("warning: saved target '{display_name}' is not connected; skipping");
+            }
+        }
+    }
+    if targets.is_empty() {
+        bail!("none of the saved targets are currently available");
+    }
+    Ok((source, targets))
+}
+
+/// Saves the session (phase 7: restart restores devices and volumes). An
+/// explicitly given source is stored; otherwise the source stays None so a
+/// restore keeps following the default render device. Reserved fields
+/// (delay_ms) of existing entries are preserved.
+fn persist_session(source: Option<String>, targets: &[engine::Target]) {
+    let previous = config::load().unwrap_or_default();
+    let new_config = config::Config {
+        source,
+        targets: targets
+            .iter()
+            .map(|t| config::TargetConfig {
+                id: t.id.clone(),
+                name: t.name.clone(),
+                volume: t.volume.percent(),
+                delay_ms: previous.target(&t.id).map(|p| p.delay_ms).unwrap_or(0),
+            })
+            .collect(),
+    };
+    if new_config != previous
+        && let Err(err) = config::save(&new_config)
+    {
+        eprintln!("warning: could not save the configuration: {err:#}");
     }
 }
 

@@ -89,7 +89,7 @@ impl EngineState {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Starting => "starting",
             Self::Rebuffering => "rebuffering",
@@ -144,6 +144,26 @@ impl DeviceStats {
         self.drift_ppm.store(ppm, Ordering::Relaxed);
     }
 
+    pub fn state(&self) -> EngineState {
+        EngineState::from_u8(self.state.load(Ordering::Relaxed))
+    }
+
+    pub fn fill_ms(&self) -> u64 {
+        self.fill_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn drift_ppm(&self) -> i64 {
+        self.drift_ppm.load(Ordering::Relaxed)
+    }
+
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
+    pub fn overruns(&self) -> u64 {
+        self.overruns.load(Ordering::Relaxed)
+    }
+
     fn status_line(&self, index: usize) -> String {
         format!(
             "  [{index}] {}: state={} vol={}% fill={}ms drift={:+}ppm underruns={} overruns={}",
@@ -158,9 +178,59 @@ impl DeviceStats {
     }
 }
 
-/// Runs the engine until Enter is pressed, `seconds` elapse (if given), or
-/// the source fails.
-pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result<()> {
+/// A started engine: the control interface for CLI and GUI frontends.
+///
+/// Dropping the handle stops the engine and joins all threads.
+pub struct EngineHandle {
+    stop: Arc<AtomicBool>,
+    stats: Vec<Arc<DeviceStats>>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
+impl EngineHandle {
+    /// Per-target statistics, index-aligned with the targets passed to
+    /// `start`.
+    pub fn stats(&self) -> &[Arc<DeviceStats>] {
+        &self.stats
+    }
+
+    /// False once a stop was requested or the source thread died.
+    pub fn is_running(&self) -> bool {
+        !self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Requests a stop without blocking on the worker threads.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
+    /// Stops the engine and waits for all threads to finish.
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        self.request_stop();
+        for handle in self.threads.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for EngineHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Starts the fan-out engine (non-blocking): one source thread plus one
+/// render thread per target. Volume handles stay with the caller via the
+/// `Target`s; status is exposed through `EngineHandle::stats`.
+pub fn start(source: Source, targets: &[Target]) -> Result<EngineHandle> {
     let source_rate = match &source {
         Source::Loopback { sample_rate, .. } => *sample_rate,
         Source::Tone => TONE_RATE,
@@ -170,8 +240,8 @@ pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result
     let stop = Arc::new(AtomicBool::new(false));
 
     let mut stats_list = Vec::new();
-    let mut render_handles = Vec::new();
-    for target in &targets {
+    let mut threads = Vec::new();
+    for target in targets {
         let stats = Arc::new(DeviceStats::new(
             target.name.clone(),
             Arc::clone(&target.volume),
@@ -195,7 +265,7 @@ pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result
                 }
             })
             .context("spawning render thread")?;
-        render_handles.push(handle);
+        threads.push(handle);
     }
 
     let source_handle = {
@@ -219,15 +289,28 @@ pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result
             })
             .context("spawning source thread")?
     };
+    threads.push(source_handle);
+
+    Ok(EngineHandle {
+        stop,
+        stats: stats_list,
+        threads,
+    })
+}
+
+/// Blocking CLI frontend: runs the engine until Enter is pressed, `seconds`
+/// elapse (if given), or the source fails; prints periodic status lines.
+pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result<()> {
+    let volumes: Vec<(String, Arc<Volume>)> = targets
+        .iter()
+        .map(|t| (t.name.clone(), Arc::clone(&t.volume)))
+        .collect();
+    let handle = start(source, &targets)?;
 
     println!("Engine running.");
     println!("Commands: 'v <target#> <0-100>' sets a device volume, Enter or 'q' stops.");
     {
-        let stop = Arc::clone(&stop);
-        let volumes: Vec<(String, Arc<Volume>)> = targets
-            .iter()
-            .map(|t| (t.name.clone(), Arc::clone(&t.volume)))
-            .collect();
+        let stop = handle.stop_flag();
         // Detached on purpose: read_line cannot be interrupted, the thread
         // ends with the process.
         thread::spawn(move || command_loop(&volumes, &stop));
@@ -235,25 +318,22 @@ pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result
 
     let started = Instant::now();
     let mut last_status = Instant::now();
-    while !stop.load(Ordering::Relaxed) {
+    while handle.is_running() {
         thread::sleep(Duration::from_millis(200));
         if let Some(limit) = seconds
             && started.elapsed() >= Duration::from_secs(limit)
         {
-            stop.store(true, Ordering::Relaxed);
+            handle.request_stop();
         }
         if last_status.elapsed() >= STATUS_INTERVAL {
             last_status = Instant::now();
             println!("status after {} s:", started.elapsed().as_secs());
-            print_status(&stats_list);
+            print_status(handle.stats());
         }
     }
-    stop.store(true, Ordering::Relaxed);
 
-    for handle in render_handles {
-        let _ = handle.join();
-    }
-    let _ = source_handle.join();
+    let stats_list: Vec<Arc<DeviceStats>> = handle.stats().to_vec();
+    handle.stop();
 
     println!("final status:");
     print_status(&stats_list);
