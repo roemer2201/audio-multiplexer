@@ -1,4 +1,4 @@
-//! Enumeration of audio render endpoints via IMMDeviceEnumerator.
+//! Enumeration and activation of audio render endpoints.
 //!
 //! References:
 //! - https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nn-mmdeviceapi-immdeviceenumerator
@@ -11,10 +11,10 @@ use std::fmt;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
     DEVICE_STATE_ACTIVE, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-    WAVEFORMATEXTENSIBLE, eConsole, eRender,
+    WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
-use windows::core::Result;
+use windows::core::{HSTRING, Result};
 
 // Format tag values from mmreg.h. Defined locally to avoid pulling in the
 // whole multimedia feature set for three constants.
@@ -27,6 +27,7 @@ const WAVE_FORMAT_TAG_EXTENSIBLE: u16 = 0xFFFE;
 const SUBTYPE_DATA1_PCM: u32 = 0x0000_0001;
 const SUBTYPE_DATA1_IEEE_FLOAT: u32 = 0x0000_0003;
 
+#[derive(Clone)]
 pub struct DeviceInfo {
     pub id: String,
     pub name: String,
@@ -34,6 +35,7 @@ pub struct DeviceInfo {
     pub mix_format: MixFormat,
 }
 
+#[derive(Clone, Copy)]
 pub struct MixFormat {
     pub sample_rate: u32,
     pub channels: u16,
@@ -41,10 +43,30 @@ pub struct MixFormat {
     pub sample_type: SampleType,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SampleType {
     Pcm,
     Float,
     Other(u16),
+}
+
+/// The sample layouts the streaming engine can convert from and to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StreamSampleKind {
+    Float32,
+    Pcm16,
+}
+
+impl MixFormat {
+    /// Returns the supported streaming layout, or None if the engine cannot
+    /// handle this mix format yet.
+    pub fn stream_kind(&self) -> Option<StreamSampleKind> {
+        match (self.sample_type, self.bits_per_sample) {
+            (SampleType::Float, 32) => Some(StreamSampleKind::Float32),
+            (SampleType::Pcm, 16) => Some(StreamSampleKind::Pcm16),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for MixFormat {
@@ -62,13 +84,16 @@ impl fmt::Display for MixFormat {
     }
 }
 
+unsafe fn create_enumerator() -> Result<IMMDeviceEnumerator> {
+    unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+}
+
 /// Lists all active render endpoints, including their shared-mode mix format.
 ///
 /// COM must already be initialized on the calling thread (see `com::ComGuard`).
 pub fn list_render_devices() -> Result<Vec<DeviceInfo>> {
     unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let enumerator = create_enumerator()?;
 
         // The default endpoint is only used to mark the matching list entry;
         // there may be none at all (no active devices), so errors are ignored.
@@ -86,11 +111,53 @@ pub fn list_render_devices() -> Result<Vec<DeviceInfo>> {
             devices.push(DeviceInfo {
                 is_default: default_id.as_deref() == Some(id.as_str()),
                 name: friendly_name(&device)?,
-                mix_format: mix_format(&device)?,
+                mix_format: activate_client(&device)?.format,
                 id,
             });
         }
         Ok(devices)
+    }
+}
+
+/// Opens an endpoint by its IMMDevice ID string.
+pub fn get_device(id: &str) -> Result<IMMDevice> {
+    unsafe {
+        let enumerator = create_enumerator()?;
+        enumerator.GetDevice(&HSTRING::from(id))
+    }
+}
+
+/// An activated IAudioClient together with the endpoint's parsed mix format
+/// and the full WAVEFORMATEX blob needed for IAudioClient::Initialize.
+pub struct ClientHandle {
+    pub client: IAudioClient,
+    pub format: MixFormat,
+    format_blob: Vec<u8>,
+}
+
+impl ClientHandle {
+    /// Pointer to the complete mix format (WAVEFORMATEX header plus cbSize
+    /// extension bytes), valid as long as this handle lives.
+    pub fn format_ptr(&self) -> *const WAVEFORMATEX {
+        self.format_blob.as_ptr() as *const WAVEFORMATEX
+    }
+}
+
+/// Activates an IAudioClient on the device and reads its mix format.
+pub fn activate_client(device: &IMMDevice) -> Result<ClientHandle> {
+    unsafe {
+        let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
+        let format_ptr = client.GetMixFormat()?;
+        let header = *format_ptr;
+        let blob_len = std::mem::size_of::<WAVEFORMATEX>() + header.cbSize as usize;
+        let format_blob = std::slice::from_raw_parts(format_ptr as *const u8, blob_len).to_vec();
+        let format = parse_format(format_ptr);
+        CoTaskMemFree(Some(format_ptr as *const c_void));
+        Ok(ClientHandle {
+            client,
+            format,
+            format_blob,
+        })
     }
 }
 
@@ -111,12 +178,9 @@ unsafe fn friendly_name(device: &IMMDevice) -> Result<String> {
     }
 }
 
-unsafe fn mix_format(device: &IMMDevice) -> Result<MixFormat> {
+unsafe fn parse_format(format_ptr: *const WAVEFORMATEX) -> MixFormat {
     unsafe {
-        let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
-        let format_ptr = client.GetMixFormat()?;
         let format = *format_ptr;
-
         let sample_type = match format.wFormatTag {
             WAVE_FORMAT_TAG_PCM => SampleType::Pcm,
             WAVE_FORMAT_TAG_IEEE_FLOAT => SampleType::Float,
@@ -130,14 +194,11 @@ unsafe fn mix_format(device: &IMMDevice) -> Result<MixFormat> {
             }
             other => SampleType::Other(other),
         };
-
-        let mix_format = MixFormat {
+        MixFormat {
             sample_rate: format.nSamplesPerSec,
             channels: format.nChannels,
             bits_per_sample: format.wBitsPerSample,
             sample_type,
-        };
-        CoTaskMemFree(Some(format_ptr as *const c_void));
-        Ok(mix_format)
+        }
     }
 }

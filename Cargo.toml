@@ -7,7 +7,10 @@ description = "Plays Windows system audio on multiple output devices simultaneou
 repository = "https://github.com/roemer2201/audio-multiplexer"
 
 [dependencies]
+anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
+hound = "3.5"
+rubato = "3.0"
 
 [dependencies.windows]
 version = "0.62"
@@ -17,6 +20,8 @@ features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_Security",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Devices_FunctionDiscovery",
 ]

@@ -11,12 +11,21 @@ compensation.
 
 ## Status
 
-Early development. Currently implemented:
+Early development. Currently implemented (CLI spike, phases 0-5 of the
+roadmap):
 
-- `audio-multiplexer list` - enumerate all active render endpoints
-  with ID, friendly name, default marker, and shared-mode mix format
+- `list` - enumerate all active render endpoints with ID, friendly
+  name, default marker, and shared-mode mix format
+- `record` - capture a render endpoint via WASAPI loopback into a WAV
+  file (verification tool)
+- `play` - capture a source endpoint and play it on one or more
+  target devices simultaneously, with per-device clock-drift
+  compensation (see [docs/drift.md](docs/drift.md))
+- `test-tone` - play a periodic click pattern on multiple devices to
+  measure their relative drift
 
-See [PLAN.md](PLAN.md) for the full implementation roadmap.
+Not yet implemented: per-device volume, GUI, config persistence,
+hot-plug handling. See [PLAN.md](PLAN.md) for the full roadmap.
 
 ## Requirements
 
@@ -36,10 +45,24 @@ be delayed, so the copies will audibly lag behind it (echo limitation).
 
 ```
 audio-multiplexer list
+audio-multiplexer record [--source <DEV>] [--seconds 10] [--out capture.wav]
+audio-multiplexer play [--source <DEV>] --target <DEV> [--target <DEV> ...]
+audio-multiplexer test-tone --target <DEV> --target <DEV> [--seconds N]
 ```
 
-Lists all active audio render endpoints. More subcommands (record,
-play) will follow per the roadmap.
+`<DEV>` is an index from `list`, an endpoint ID, or an exact device
+name. `--source` defaults to the Windows default render device (set
+your silent virtual device as default so applications play into it).
+The engine prints a status line per device every 5 seconds (buffer
+fill, applied drift correction, underruns); stop it with Enter or
+`--seconds`.
+
+Notes:
+
+- Loopback only delivers audio while something is playing on the
+  source endpoint; during silence the engine rebuffers.
+- A target must not be the same device as the loopback source (this
+  would create a feedback loop); the CLI rejects it.
 
 ## Building
 
