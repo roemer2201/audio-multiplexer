@@ -105,6 +105,11 @@ Key points:
 
 - ASCII-only characters in all code, scripts, and generated files.
   No Unicode symbols, no emojis, no typographic quotes.
+- No spaces in file and directory names anywhere the project creates
+  them (repo files, install directory, shortcuts, program groups,
+  release artifacts); use lowercase hyphenated names like
+  "audio-multiplexer". Display-only strings (window title, entries in
+  the installed-programs list) may contain spaces.
 - Code, comments, commit messages, and technical documentation in
   English. Communication with the project owner in German.
 - Git workflow: all changes go into a branch named "claude".

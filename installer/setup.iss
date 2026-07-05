@@ -14,6 +14,10 @@
   #define AppVersion "0.0.0"
 #endif
 
+; Display names (AppName, shortcut descriptions) may contain spaces; every
+; name that becomes a file or folder (install dir, program group, shortcut
+; file names) must not, by project convention.
+
 [Setup]
 AppId={{7E9B7C41-4D0C-4B9A-9A63-2F3D9E5A1C58}
 AppName=Audio Multiplexer
@@ -21,8 +25,8 @@ AppVersion={#AppVersion}
 AppPublisher=roemer2201
 AppPublisherURL=https://github.com/roemer2201/audio-multiplexer
 AppSupportURL=https://github.com/roemer2201/audio-multiplexer/issues
-DefaultDirName={autopf}\Audio Multiplexer
-DefaultGroupName=Audio Multiplexer
+DefaultDirName={autopf}\audio-multiplexer
+DefaultGroupName=audio-multiplexer
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=Output
@@ -50,8 +54,8 @@ Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Audio Multiplexer"; Filename: "{app}\audio-multiplexer.exe"
-Name: "{autodesktop}\Audio Multiplexer"; \
+Name: "{group}\audio-multiplexer"; Filename: "{app}\audio-multiplexer.exe"
+Name: "{autodesktop}\audio-multiplexer"; \
     Filename: "{app}\audio-multiplexer.exe"; Tasks: desktopicon
 
 [Run]
