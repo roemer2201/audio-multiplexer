@@ -50,9 +50,25 @@ Without a virtual device, loopback capture of a real device still
 works, but that device is also rendered directly by Windows and cannot
 be delayed, so the copies will audibly lag behind it (echo limitation).
 
+## Installation
+
+From the [GitHub releases](https://github.com/roemer2201/audio-multiplexer/releases):
+
+- `audio-multiplexer-setup-<version>.exe` - per-user installer (no
+  administrator rights needed, installs below
+  `%LOCALAPPDATA%\Programs`, creates a Start Menu entry and an
+  uninstaller). Built with Inno Setup by the release workflow.
+- `audio-multiplexer-<version>-windows-x64.zip` - portable version;
+  unpack anywhere and run `audio-multiplexer.exe`.
+
+The binaries are not code-signed; Windows SmartScreen may warn on
+first launch ("More info" > "Run anyway"). Uninstalling keeps the
+per-user config (`%APPDATA%\audio-multiplexer\config.toml`).
+
 ## Setup
 
-1. Install one of the virtual audio devices above.
+1. Install one of the virtual audio devices above (the installer does
+   not bundle a driver; the app is driver-agnostic).
 2. Set the virtual device as the Windows default output (Settings >
    System > Sound), so applications play into it silently.
 3. Start `audio-multiplexer.exe`: pick the virtual device as source
@@ -105,8 +121,15 @@ cargo build --release
 ```
 
 CI runs `cargo fmt --check`, `cargo clippy -- -D warnings`, build and
-tests on windows-latest. Pushing a tag `v*` builds a release zip and
-drafts a GitHub release (see `.github/workflows/release.yml`).
+tests on windows-latest. Pushing a tag `v*` builds the portable zip
+and the Inno Setup installer (`installer/setup.iss`) and drafts a
+GitHub release (see `.github/workflows/release.yml`). To build the
+installer locally, install Inno Setup 6 and run:
+
+```
+cargo build --release
+iscc /DAppVersion=1.0.0 installer\setup.iss
+```
 
 ## License
 

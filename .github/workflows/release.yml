@@ -22,16 +22,23 @@ jobs:
         run: cargo build --release
       - name: Test
         run: cargo test --release
-      - name: Package
+      - name: Package portable zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target/release/audio-multiplexer.exe dist/
           Copy-Item README.md,LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath "audio-multiplexer-${{ github.ref_name }}-windows-x64.zip"
+      - name: Build installer (Inno Setup, preinstalled on windows-latest)
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$version installer\setup.iss
       - name: Draft GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: audio-multiplexer-*.zip
+          files: |
+            audio-multiplexer-*.zip
+            installer/Output/audio-multiplexer-setup-*.exe
           draft: true
           generate_release_notes: true
