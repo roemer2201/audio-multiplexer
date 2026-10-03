@@ -106,14 +106,22 @@ pub fn list_render_devices() -> Result<Vec<DeviceInfo>> {
         let count = collection.GetCount()?;
         let mut devices = Vec::with_capacity(count as usize);
         for i in 0..count {
-            let device = collection.Item(i)?;
-            let id = device_id(&device)?;
-            devices.push(DeviceInfo {
-                is_default: default_id.as_deref() == Some(id.as_str()),
-                name: friendly_name(&device)?,
-                mix_format: activate_client(&device)?.format,
-                id,
+            // An endpoint that is being removed can fail between enumeration
+            // and activation. Skip only that endpoint, so a hot-plug race
+            // does not discard the healthy rest of the device list.
+            let info = collection.Item(i).and_then(|device| {
+                let id = device_id(&device)?;
+                Ok(DeviceInfo {
+                    is_default: default_id.as_deref() == Some(id.as_str()),
+                    name: friendly_name(&device)?,
+                    mix_format: activate_client(&device)?.format,
+                    id,
+                })
             });
+            match info {
+                Ok(info) => devices.push(info),
+                Err(err) => eprintln!("warning: skipping render endpoint #{i}: {err}"),
+            }
         }
         Ok(devices)
     }
