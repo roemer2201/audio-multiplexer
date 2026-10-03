@@ -14,6 +14,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::capture::{LoopbackCapture, POLL_INTERVAL};
 use crate::com::ComGuard;
+use crate::outcome::WorkerFailure;
 use crate::render::{self, RenderParams};
 use crate::ring::Ring;
 use crate::session::TargetChanges;
@@ -111,6 +112,7 @@ pub struct DeviceStats {
     overruns: AtomicU64,
     fill_ms: AtomicU64,
     drift_ppm: AtomicI64,
+    failure: WorkerFailure,
 }
 
 impl DeviceStats {
@@ -123,6 +125,7 @@ impl DeviceStats {
             overruns: AtomicU64::new(0),
             fill_ms: AtomicU64::new(0),
             drift_ppm: AtomicI64::new(0),
+            failure: WorkerFailure::default(),
         }
     }
 
@@ -166,9 +169,13 @@ impl DeviceStats {
         self.overruns.load(Ordering::Relaxed)
     }
 
+    pub fn failure(&self) -> Option<String> {
+        self.failure.message()
+    }
+
     fn status_line(&self, index: usize) -> String {
         format!(
-            "  [{index}] {}: state={} vol={}% fill={}ms drift={:+}ppm underruns={} overruns={}",
+            "  [{index}] {}: state={} vol={}% fill={}ms drift={:+}ppm underruns={} overruns={}{}",
             self.name,
             EngineState::from_u8(self.state.load(Ordering::Relaxed)).as_str(),
             self.volume.percent(),
@@ -176,6 +183,9 @@ impl DeviceStats {
             self.drift_ppm.load(Ordering::Relaxed),
             self.underruns.load(Ordering::Relaxed),
             self.overruns.load(Ordering::Relaxed),
+            self.failure()
+                .map(|e| format!(" error={e}"))
+                .unwrap_or_default(),
         )
     }
 }
@@ -192,6 +202,7 @@ pub struct EngineHandle {
     ring: Arc<Ring>,
     sync: Arc<SyncBudget>,
     source_rate: u32,
+    source_failure: Arc<WorkerFailure>,
 }
 
 struct RenderWorker {
@@ -262,7 +273,10 @@ impl EngineHandle {
         let mut index = 0;
         while index < self.retired.len() {
             if self.retired[index].is_finished() {
-                let _ = self.retired.swap_remove(index).join();
+                if self.retired.swap_remove(index).join().is_err() {
+                    self.source_failure
+                        .record("retired worker panicked outside its boundary".into());
+                }
             } else {
                 index += 1;
             }
@@ -282,7 +296,28 @@ impl EngineHandle {
 
     /// False once a stop was requested or the source thread died.
     pub fn is_running(&self) -> bool {
-        !self.stop.load(Ordering::Relaxed)
+        !self.stop.load(Ordering::Acquire)
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        self.source_failure.message()
+    }
+
+    fn result(&self) -> Result<()> {
+        if let Some(error) = self.failure() {
+            anyhow::bail!("source failed: {error}");
+        }
+        if !self.stats.is_empty() && self.stats.iter().all(|s| s.failure().is_some()) {
+            anyhow::bail!(
+                "all render devices failed: {}",
+                self.stats
+                    .iter()
+                    .map(|s| format!("{}: {}", s.name, s.failure().unwrap_or_default()))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+        Ok(())
     }
 
     /// Requests a stop without blocking on the worker threads.
@@ -295,20 +330,30 @@ impl EngineHandle {
     }
 
     /// Stops the engine and waits for all threads to finish.
-    pub fn stop(mut self) {
+    pub fn stop(mut self) -> Result<()> {
         self.shutdown();
+        self.result()
     }
 
     fn shutdown(&mut self) {
         self.request_stop();
         for handle in self.threads.drain(..) {
-            let _ = handle.join();
+            if handle.join().is_err() {
+                self.source_failure
+                    .record("worker panicked outside its boundary".into());
+            }
         }
         for worker in self.renderers.drain(..) {
-            let _ = worker.thread.join();
+            if worker.thread.join().is_err() {
+                self.source_failure
+                    .record("render worker panicked outside its boundary".into());
+            }
         }
         for handle in self.retired.drain(..) {
-            let _ = handle.join();
+            if handle.join().is_err() {
+                self.source_failure
+                    .record("worker panicked outside its boundary".into());
+            }
         }
     }
 }
@@ -340,24 +385,21 @@ pub fn start(source: Source, targets: &[Target]) -> Result<EngineHandle> {
         stats_list.push(stats);
     }
 
+    let source_failure = Arc::new(WorkerFailure::default());
     let source_handle = {
         let ring = Arc::clone(&ring);
         let stop = Arc::clone(&stop);
+        let failure = Arc::clone(&source_failure);
         thread::Builder::new()
             .name("source".to_string())
             .spawn(move || {
-                let result = match source {
+                failure.run_source(&stop, || match source {
                     Source::Loopback {
                         device_id,
                         sample_rate,
                     } => run_loopback_source(&device_id, sample_rate, &ring, &stop),
                     Source::Tone => run_tone_source(&ring, &stop),
-                };
-                if let Err(err) = result {
-                    eprintln!("source failed: {err:#}");
-                }
-                // Without a source the engine cannot continue.
-                stop.store(true, Ordering::Relaxed);
+                });
             })
             .context("spawning source thread")?
     };
@@ -370,6 +412,7 @@ pub fn start(source: Source, targets: &[Target]) -> Result<EngineHandle> {
         ring,
         sync,
         source_rate,
+        source_failure,
     })
 }
 
@@ -401,9 +444,12 @@ fn spawn_renderer(
     let thread = thread::Builder::new()
         .name(format!("render {}", target.name))
         .spawn(move || {
-            if let Err(err) = render::run(params, reader, worker_stop) {
+            worker_stats
+                .failure
+                .run(|| render::run(params, reader, worker_stop));
+            if let Some(error) = worker_stats.failure() {
                 worker_stats.set_state(EngineState::Failed);
-                eprintln!("render device '{}' failed: {err:#}", worker_stats.name);
+                eprintln!("render device '{}' failed: {error}", worker_stats.name);
             }
         })
         .context("spawning render thread")?;
@@ -439,6 +485,9 @@ pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result
     let mut last_status = Instant::now();
     while handle.is_running() {
         thread::sleep(Duration::from_millis(200));
+        if handle.result().is_err() {
+            handle.request_stop();
+        }
         if let Some(limit) = seconds
             && started.elapsed() >= Duration::from_secs(limit)
         {
@@ -452,11 +501,11 @@ pub fn run(source: Source, targets: Vec<Target>, seconds: Option<u64>) -> Result
     }
 
     let stats_list: Vec<Arc<DeviceStats>> = handle.stats().to_vec();
-    handle.stop();
+    let result = handle.stop();
 
     println!("final status:");
     print_status(&stats_list);
-    Ok(())
+    result
 }
 
 fn print_status(stats_list: &[Arc<DeviceStats>]) {
@@ -520,19 +569,21 @@ fn run_loopback_source(
     stop: &AtomicBool,
 ) -> Result<()> {
     let _com = ComGuard::new()?;
-    let mut capture = LoopbackCapture::open(device_id)?;
+    let mut capture = LoopbackCapture::open(device_id).context("opening capture")?;
     ensure!(
         capture.format().sample_rate == expected_rate,
         "source sample rate changed between setup and start ({} vs {})",
         capture.format().sample_rate,
         expected_rate
     );
-    capture.start()?;
+    capture.start().context("starting capture")?;
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(POLL_INTERVAL);
-        capture.drain(&mut |chunk| ring.write(chunk))?;
+        capture
+            .drain(&mut |chunk| ring.write(chunk))
+            .context("draining capture")?;
     }
-    capture.stop()?;
+    capture.stop().context("stopping capture")?;
     if capture.discontinuities > 0 {
         println!(
             "note: {} capture discontinuities occurred",
@@ -545,6 +596,60 @@ fn run_loopback_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn idle_handle() -> EngineHandle {
+        EngineHandle {
+            stop: Arc::new(AtomicBool::new(false)),
+            stats: Vec::new(),
+            threads: Vec::new(),
+            renderers: Vec::new(),
+            retired: Vec::new(),
+            ring: Ring::new(TONE_RATE as usize * RING_SECONDS),
+            sync: SyncBudget::new(4800, 0),
+            source_rate: TONE_RATE,
+            source_failure: Arc::new(WorkerFailure::default()),
+        }
+    }
+
+    #[test]
+    fn source_failure_reaches_the_frontend_shutdown_result() {
+        for stage in ["opening capture", "starting capture", "draining capture"] {
+            let mut handle = idle_handle();
+            let failure = Arc::clone(&handle.source_failure);
+            let stop = Arc::clone(&handle.stop);
+            handle.threads.push(thread::spawn(move || {
+                failure.run_source(&stop, || anyhow::bail!("{stage}: injected failure"));
+            }));
+            let error = handle.stop().unwrap_err().to_string();
+            assert_eq!(error, format!("source failed: {stage}: injected failure"));
+        }
+        idle_handle().stop().unwrap();
+    }
+
+    #[test]
+    fn one_failed_output_is_isolated_but_all_failed_outputs_are_an_error() {
+        let mut handle = idle_handle();
+        let failed = Arc::new(DeviceStats::new("failed".into(), Volume::new(100)));
+        failed.failure.record("device removed".into());
+        failed.set_state(EngineState::Failed);
+        handle.stats.push(failed);
+        assert!(handle.result().is_err());
+        handle.stats.push(Arc::new(DeviceStats::new(
+            "healthy".into(),
+            Volume::new(100),
+        )));
+        assert!(handle.is_running());
+        handle.stop().unwrap();
+    }
+
+    #[test]
+    fn unexpected_join_panic_is_not_silently_discarded() {
+        let mut handle = idle_handle();
+        handle
+            .threads
+            .push(thread::spawn(|| panic!("outside boundary")));
+        assert!(handle.stop().unwrap_err().to_string().contains("panicked"));
+    }
 
     /// Exercise actual worker reconciliation with synthetic workers, so no
     /// audio device is needed even when this test runs in Windows CI.
@@ -586,6 +691,7 @@ mod tests {
             ring: Ring::new(TONE_RATE as usize * RING_SECONDS),
             sync: SyncBudget::new(4800, 0),
             source_rate: TONE_RATE,
+            source_failure: Arc::new(WorkerFailure::default()),
         };
         let before = progress.load(Ordering::Relaxed);
         handle
@@ -603,6 +709,6 @@ mod tests {
             thread::yield_now();
         }
         assert!(progress.load(Ordering::Relaxed) > before);
-        handle.stop();
+        handle.stop().unwrap();
     }
 }

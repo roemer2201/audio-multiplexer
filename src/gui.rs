@@ -292,7 +292,9 @@ impl App {
         let mut index = 0;
         while index < self.retired_engines.len() {
             if self.retired_engines[index].is_finished() {
-                self.retired_engines.swap_remove(index).stop();
+                if let Err(error) = self.retired_engines.swap_remove(index).stop() {
+                    self.engine_notice = Some(format!("engine stopped: {error:#}"));
+                }
             } else {
                 index += 1;
             }
@@ -332,10 +334,14 @@ impl App {
             .as_ref()
             .is_some_and(|running| !running.handle.is_running());
         if died {
+            let error = self
+                .engine
+                .as_ref()
+                .and_then(|e| e.handle.failure())
+                .unwrap_or_else(|| "the source stopped".into());
             self.run_intent.stop();
             self.stop_engine();
-            self.engine_notice =
-                Some("engine stopped: the source failed or was removed".to_string());
+            self.engine_notice = Some(format!("engine stopped: {error}"));
         }
     }
 
@@ -489,6 +495,9 @@ impl App {
                 stats.underruns(),
                 stats.overruns()
             ));
+            if let Some(error) = stats.failure() {
+                ui.colored_label(egui::Color32::RED, error);
+            }
         }
     }
 }
@@ -569,7 +578,8 @@ impl Drop for App {
     fn drop(&mut self) {
         self.request_stop();
         for handle in self.retired_engines.drain(..) {
-            handle.stop();
+            // Closing the app has no remaining UI to display an outcome.
+            let _ = handle.stop();
         }
         // Callback unregistration must precede release of the COM guard.
         self.watcher.take();

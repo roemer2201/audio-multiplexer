@@ -8,6 +8,7 @@ mod devices;
 mod engine;
 mod gui;
 mod hotplug;
+mod outcome;
 mod render;
 mod resample;
 mod ring;

@@ -68,6 +68,11 @@ The findings below preserve the original reviewed state.
   target-delta test passes; a synthetic-worker isolation test is included
   for native Windows CI. All 15 core tests pass and Windows Clippy is clean.
 
+- R7: source failures retain their full error chain, publish before stop,
+  and propagate through CLI shutdown as a nonzero exit. GUI source/device
+  status includes the cause; panics become failed outcomes. Portable tests
+  inject open/start/drain failures, panic and normal stop.
+
 ### R1 [P1] Equal ring fill does not align the actual playback positions
 
 Location: src/render.rs:148-160, 206-222; src/engine.rs:24-27, 238-239.
