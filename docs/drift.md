@@ -61,6 +61,12 @@ References:
 
 ## Controller
 
+Rate conversion uses a windowed sinc filter (256 taps, Blackman-Harris
+window). The cutoff includes the lowest ratio allowed by the +/-2 percent
+controller range, because rubato does not rebuild the filter on ratio
+changes. Signal tests verify passband gain and alias RMS below 0.001
+for selected out-of-band tones at the tested downward rate pairs.
+
 Implemented in `src/render.rs` (`DriftController`):
 
 - Total playback lag is sampled every render pass (typically every 10 ms)

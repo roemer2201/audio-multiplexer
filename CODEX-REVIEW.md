@@ -39,6 +39,11 @@ from the missing behavior visible in the code.
   IAudioClock/QPC measurement, queued-output accounting and resampler delay.
   Four platform-independent timing tests pass. Hardware measurements remain
   required; documentation distinguishes driver alignment from acoustic sync.
+- R2: replaced polynomial interpolation with band-limited sinc conversion.
+  The cutoff covers the full allowed drift range. Actual DSP tests preserve
+  a 1 kHz passband tone and suppress selected alias tones at 48->44.1,
+  96->48 and 192->48 kHz, at both correction limits. All 10 core tests pass;
+  cross-target Windows Clippy is clean.
 
 The findings below preserve the original reviewed state.
 

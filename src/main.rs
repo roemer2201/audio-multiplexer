@@ -9,6 +9,7 @@ mod engine;
 mod gui;
 mod hotplug;
 mod render;
+mod resample;
 mod ring;
 mod sync;
 mod tone;

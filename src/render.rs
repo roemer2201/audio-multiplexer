@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use rubato::Resampler;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
-use rubato::{Async, FixedAsync, PolynomialDegree, Resampler};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -30,11 +30,9 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use crate::com::ComGuard;
 use crate::devices::{self, StreamSampleKind};
 use crate::engine::{DeviceStats, EngineState, Volume};
+use crate::resample::{self, CORRECTION_LIMIT};
 use crate::ring::{CHANNELS, ReadError, Reader};
 use crate::sync::{SyncBudget, pending_source_frames, played_frames};
-
-/// Allowed adjustment range of the resampling ratio at construction time.
-const MAX_RATIO_RELATIVE: f64 = 1.25;
 
 /// How often the drift controller updates the resampling ratio.
 const CONTROL_INTERVAL: Duration = Duration::from_millis(100);
@@ -47,9 +45,6 @@ const GAIN_I: f64 = 0.005;
 
 /// Anti-windup clamp for the integral term (absolute ratio correction).
 const INTEGRAL_LIMIT: f64 = 0.005;
-
-/// Hard clamp for the total ratio correction (2 percent).
-const CORRECTION_LIMIT: f64 = 0.02;
 
 /// Smoothing factor for the fill-level EMA, applied once per render pass.
 const FILL_EMA_ALPHA: f64 = 0.1;
@@ -114,15 +109,7 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
     let mut qpc_frequency = 0;
     unsafe { QueryPerformanceFrequency(&mut qpc_frequency)? };
 
-    let base_ratio = f64::from(device_rate) / f64::from(params.source_rate);
-    let mut resampler = Async::<f32>::new_poly(
-        base_ratio,
-        MAX_RATIO_RELATIVE,
-        PolynomialDegree::Septic,
-        buffer_frames as usize,
-        CHANNELS,
-        FixedAsync::Output,
-    )?;
+    let mut resampler = resample::new(params.source_rate, device_rate, buffer_frames as usize)?;
     let mut in_buf = vec![0.0f32; resampler.input_frames_max() * CHANNELS];
     let mut out_buf = vec![0.0f32; buffer_frames as usize * CHANNELS];
 
