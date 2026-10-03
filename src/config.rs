@@ -4,7 +4,8 @@
 //! unplugged); consumers mark them unavailable instead of dropping them.
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -68,7 +69,28 @@ pub fn save(config: &Config) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let text = toml::to_string_pretty(config).context("serializing config")?;
-    fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    write_atomic(&path, text.as_bytes()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Writes a sibling temporary file, flushes it, and renames it over `path`.
+/// An interrupted write therefore never truncates the previous valid file.
+/// std::fs::rename replaces an existing destination on all platforms. The
+/// process ID keeps a concurrently saving CLI and GUI instance apart.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
+    temp_name.push(format!(".{}.tmp", std::process::id()));
+    let temp = path.with_file_name(temp_name);
+    let result = (|| {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -102,5 +124,21 @@ mod tests {
         assert_eq!(parsed.targets[0].volume, 100);
         assert_eq!(parsed.targets[0].delay_ms, 0);
         assert_eq!(parsed.targets[0].name, "");
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_without_leftovers() {
+        let dir = std::env::temp_dir().join(format!(
+            "audio-multiplexer-config-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        write_atomic(&path, b"old = 1\n").unwrap();
+        write_atomic(&path, b"new = 2\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new = 2\n");
+        let entries: Vec<_> = fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
