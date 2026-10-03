@@ -10,6 +10,7 @@ mod gui;
 mod hotplug;
 mod render;
 mod ring;
+mod sync;
 mod tone;
 
 use std::path::PathBuf;

@@ -6,30 +6,32 @@
 //! device's shared-mode buffer.
 //!
 //! Clock-drift compensation: the device consumes at its own clock, the source
-//! produces at the source clock. Any rate mismatch shows up as a trend in the
-//! ring buffer fill level, so a slow PI controller steers the resampling
-//! ratio to hold the fill level at a fixed target. This compensates both
-//! nominal rate differences and slow clock drift without relying on device
-//! timestamps. The approach and its tuning are documented in docs/drift.md.
+//! produces at the source clock. A slow PI controller holds total playback
+//! lag constant: unread source plus resampler delay plus samples submitted
+//! but not yet played according to IAudioClock. All outputs share a latency
+//! budget, rather than assuming that equal ring fill means equal playback.
+//! The approach and its tuning are documented in docs/drift.md.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Async, FixedAsync, PolynomialDegree, Resampler};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    IAudioRenderClient,
+    IAudioClock, IAudioRenderClient,
 };
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::com::ComGuard;
 use crate::devices::{self, StreamSampleKind};
 use crate::engine::{DeviceStats, EngineState, Volume};
 use crate::ring::{CHANNELS, ReadError, Reader};
+use crate::sync::{SyncBudget, pending_source_frames, played_frames};
 
 /// Allowed adjustment range of the resampling ratio at construction time.
 const MAX_RATIO_RELATIVE: f64 = 1.25;
@@ -59,7 +61,7 @@ const GAIN_RAMP_SECONDS: f32 = 0.010;
 pub struct RenderParams {
     pub device_id: String,
     pub source_rate: u32,
-    pub target_fill_frames: u64,
+    pub sync: Arc<SyncBudget>,
     pub volume: Arc<Volume>,
     pub stats: Arc<DeviceStats>,
 }
@@ -76,6 +78,7 @@ impl Drop for EventHandle {
 }
 
 pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> Result<()> {
+    let preparation = params.sync.preparation();
     let stats = &params.stats;
     let _com = ComGuard::new()?;
     let device = devices::get_device(&params.device_id).context("opening target device")?;
@@ -105,6 +108,11 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
     let event = EventHandle(unsafe { CreateEventW(None, false, false, None)? });
     unsafe { handle.client.SetEventHandle(event.0)? };
     let render: IAudioRenderClient = unsafe { handle.client.GetService()? };
+    let clock: IAudioClock = unsafe { handle.client.GetService()? };
+    let clock_frequency = unsafe { clock.GetFrequency()? };
+    ensure!(clock_frequency > 0, "target clock returned zero frequency");
+    let mut qpc_frequency = 0;
+    unsafe { QueryPerformanceFrequency(&mut qpc_frequency)? };
 
     let base_ratio = f64::from(device_rate) / f64::from(params.source_rate);
     let mut resampler = Async::<f32>::new_poly(
@@ -118,6 +126,20 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
     let mut in_buf = vec![0.0f32; resampler.input_frames_max() * CHANNELS];
     let mut out_buf = vec![0.0f32; buffer_frames as usize * CHANNELS];
 
+    // GetStreamLatency is a maximum, used only to reserve safe headroom.
+    // Actual queued latency is measured by the playback clock below; adding
+    // the maximum again to that measurement would count latency twice.
+    let stream_latency = unsafe { handle.client.GetStreamLatency()? }.max(0) as f64 / 10_000_000.0;
+    let pipeline_frames = (stream_latency
+        + (f64::from(buffer_frames) + resampler.output_delay() as f64) / f64::from(device_rate))
+        * f64::from(params.source_rate);
+    ensure!(
+        pipeline_frames < f64::from(params.source_rate) * 2.0,
+        "target output latency exceeds the supported buffering budget"
+    );
+    params.sync.include_pipeline(pipeline_frames.ceil() as u64);
+    drop(preparation);
+
     // Pre-fill the device buffer with silence so the stream starts cleanly.
     unsafe {
         let _ = render.GetBuffer(buffer_frames)?;
@@ -125,7 +147,9 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
     }
     unsafe { handle.client.Start()? };
 
-    let mut controller = DriftController::new(params.target_fill_frames as f64);
+    let mut submitted_frames = f64::from(buffer_frames);
+
+    let mut controller = DriftController::new(params.sync.target_frames() as f64);
     let mut rebuffering = true;
     stats.set_state(EngineState::Rebuffering);
 
@@ -146,22 +170,36 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
             continue;
         }
         let padding = unsafe { handle.client.GetCurrentPadding()? };
+        let played = read_played_frames(&clock, clock_frequency, device_rate, qpc_frequency)?;
+        // If WASAPI inserted silence after an endpoint starvation, account
+        // for that stream time before numbering subsequently submitted data.
+        submitted_frames = submitted_frames.max(played + f64::from(padding));
+        let pending = pending_source_frames(
+            submitted_frames,
+            played,
+            resampler.output_delay(),
+            resampler.resample_ratio(),
+        );
+        let target = params.sync.target_frames();
+        controller.set_target(target as f64);
+        let ring_target = (target as f64 - pending).max(1.0).ceil() as u64;
         let frames_out = buffer_frames - padding;
         if frames_out == 0 {
             continue;
         }
 
         // After start or an underrun, wait until the source has produced a
-        // full target fill, then latch onto the stream exactly target frames
-        // behind the writer.
+        // enough input, then latch with a device-specific ring lag so that
+        // ring plus output pipeline reaches the common playback budget.
         if rebuffering {
-            if reader.available() >= params.target_fill_frames {
-                reader.seek_to_latest(params.target_fill_frames);
+            if params.sync.ready() && reader.available() >= ring_target {
+                reader.seek_to_latest(ring_target);
                 controller.reset();
                 rebuffering = false;
                 stats.set_state(EngineState::Running);
             } else {
                 write_silence(&render, frames_out)?;
+                submitted_frames += f64::from(frames_out);
                 continue;
             }
         }
@@ -177,13 +215,15 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
                 stats.set_state(EngineState::Rebuffering);
                 rebuffering = true;
                 write_silence(&render, frames_out)?;
+                submitted_frames += f64::from(frames_out);
                 continue;
             }
             Err(ReadError::Overwritten) => {
                 stats.add_overrun();
-                reader.seek_to_latest(params.target_fill_frames);
+                reader.seek_to_latest(ring_target);
                 controller.reset();
                 write_silence(&render, frames_out)?;
+                submitted_frames += f64::from(frames_out);
                 continue;
             }
         }
@@ -210,10 +250,20 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
             // but release only what was actually produced to stay safe.
             render.ReleaseBuffer(produced as u32, 0)?;
         }
+        submitted_frames += produced as f64;
 
-        // Drift compensation: steer the fill level back to the target.
+        // Compare playback positions in source-frame units, including data
+        // in the resampler and every sample still ahead of the device clock.
         let fill = reader.available();
-        if let Some(correction) = controller.update(fill as f64) {
+        let played = read_played_frames(&clock, clock_frequency, device_rate, qpc_frequency)?;
+        let lag = fill as f64
+            + pending_source_frames(
+                submitted_frames,
+                played,
+                resampler.output_delay(),
+                resampler.resample_ratio(),
+            );
+        if let Some(correction) = controller.update(lag) {
             resampler
                 .set_resample_ratio_relative(1.0 - correction, true)
                 .map_err(|e| anyhow!("resampler ratio: {e}"))?;
@@ -226,6 +276,24 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
     Ok(())
 }
 
+/// Convert WASAPI's clock snapshot and QPC timestamp into played frames now.
+fn read_played_frames(
+    clock: &IAudioClock,
+    frequency: u64,
+    rate: u32,
+    qpc_frequency: i64,
+) -> Result<f64> {
+    let mut position = 0;
+    let mut qpc_hns = 0;
+    let mut now = 0;
+    unsafe {
+        clock.GetPosition(&mut position, Some(&mut qpc_hns))?;
+        QueryPerformanceCounter(&mut now)?;
+    }
+    let now_hns = (now as f64 * 10_000_000.0 / qpc_frequency as f64) as u64;
+    Ok(played_frames(position, frequency, rate, qpc_hns, now_hns))
+}
+
 /// Applies the volume gain to interleaved canonical frames, ramping the
 /// applied gain toward `target` by at most `step` per frame to avoid zipper
 /// noise on volume changes.
@@ -233,7 +301,7 @@ fn apply_gain(samples: &mut [f32], current: &mut f32, target: f32, step: f32) {
     if *current == target && target == 1.0 {
         return;
     }
-    for frame in samples.chunks_exact_mut(CHANNELS) {
+    for frame in samples.as_chunks_mut::<CHANNELS>().0 {
         if *current != target {
             *current += (target - *current).clamp(-step, step);
         }
@@ -313,6 +381,13 @@ struct DriftController {
 }
 
 impl DriftController {
+    fn set_target(&mut self, target: f64) {
+        if self.target != target {
+            self.target = target;
+            self.reset();
+        }
+    }
+
     fn new(target: f64) -> Self {
         Self {
             target,
@@ -362,7 +437,12 @@ mod tests {
         let mut current = 0.0f32;
         apply_gain(&mut samples, &mut current, 1.0, 0.25);
         // Each frame steps by at most 0.25 and never exceeds the target.
-        let per_frame: Vec<f32> = samples.chunks_exact(CHANNELS).map(|f| f[0]).collect();
+        let per_frame: Vec<f32> = samples
+            .as_chunks::<CHANNELS>()
+            .0
+            .iter()
+            .map(|f| f[0])
+            .collect();
         assert_eq!(per_frame[0], 0.25);
         assert_eq!(per_frame[1], 0.5);
         assert!(per_frame.windows(2).all(|w| w[1] >= w[0]));

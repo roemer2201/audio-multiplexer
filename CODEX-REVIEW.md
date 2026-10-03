@@ -33,6 +33,15 @@ from the missing behavior visible in the code.
 
 ## Findings
 
+## Fix progress
+
+- R1: replaced equal ring-fill control with a shared playback-lag budget,
+  IAudioClock/QPC measurement, queued-output accounting and resampler delay.
+  Four platform-independent timing tests pass. Hardware measurements remain
+  required; documentation distinguishes driver alignment from acoustic sync.
+
+The findings below preserve the original reviewed state.
+
 ### R1 [P1] Equal ring fill does not align the actual playback positions
 
 Location: src/render.rs:148-160, 206-222; src/engine.rs:24-27, 238-239.

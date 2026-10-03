@@ -16,14 +16,15 @@ use crate::capture::{LoopbackCapture, POLL_INTERVAL};
 use crate::com::ComGuard;
 use crate::render::{self, RenderParams};
 use crate::ring::Ring;
+use crate::sync::SyncBudget;
 use crate::tone::{TONE_RATE, run_tone_source};
 
 /// Ring capacity in seconds of canonical audio.
 const RING_SECONDS: usize = 4;
 
 /// Per-device buffering target as a fraction of the source rate (100 ms).
-/// All devices aim for the same fill level, which keeps them mutually in
-/// sync and leaves headroom for the later per-device delay feature.
+/// Added to a common playback budget that includes the output pipelines.
+/// Equal ring fill alone cannot align devices with different latencies.
 const TARGET_FILL_DIVISOR: u64 = 10;
 
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
@@ -237,6 +238,7 @@ pub fn start(source: Source, targets: &[Target]) -> Result<EngineHandle> {
     };
     let ring = Ring::new(source_rate as usize * RING_SECONDS);
     let target_fill_frames = u64::from(source_rate) / TARGET_FILL_DIVISOR;
+    let sync = SyncBudget::new(target_fill_frames, targets.len());
     let stop = Arc::new(AtomicBool::new(false));
 
     let mut stats_list = Vec::new();
@@ -250,7 +252,7 @@ pub fn start(source: Source, targets: &[Target]) -> Result<EngineHandle> {
         let params = RenderParams {
             device_id: target.id.clone(),
             source_rate,
-            target_fill_frames,
+            sync: Arc::clone(&sync),
             volume: Arc::clone(&target.volume),
             stats: Arc::clone(&stats),
         };
