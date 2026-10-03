@@ -40,8 +40,8 @@ line numbers are retained as a record of the reviewed state.
 A stable Rust toolchain was installed for remediation. All 18 portable
 core tests pass locally, and Windows cross-target Clippy checks all targets
 with warnings denied. Native Windows CI runs formatting, Clippy, build and
-unit tests on the pull request. R1 through R7 have passed that CI; the R8
-run follows its commit. No physical audio device tests, long-duration
+unit tests on the pull request. R1 through R8 have passed that CI
+(run 8 on commit d6c4b83 is the final R8 run). No physical audio device tests, long-duration
 acoustic synchronization measurements or installer execution were performed.
 
 - R1: replaced equal ring-fill control with a shared playback-lag budget,
@@ -76,6 +76,26 @@ acoustic synchronization measurements or installer execution were performed.
   spawn error drops the partial engine, signals stop and joins every owned
   thread before returning the error. Synthetic-worker tests inject second
   renderer and source spawn failures and also verify successful startup.
+
+## Follow-up fixes (2026-10-03)
+
+A second review of the R1-R8 commits found no build, Clippy or logic
+defects in them (portable tests and Windows cross-target Clippy pass).
+Two items from "Further improvements" below were fixed on
+claude/review-repo-commits-gv02l3, because they undermine the R4/R5
+hot-plug behavior and configuration persistence:
+
+- config::save writes a sibling temporary file, flushes it and renames it
+  over config.toml (std::fs::rename replaces an existing destination).
+  An interrupted write no longer truncates the previous configuration.
+  The temporary name contains the process ID, so a CLI and a GUI saving
+  at the same time do not share a temporary file. The last writer still
+  wins; there is no cross-instance merge.
+- list_render_devices skips a single endpoint whose ID, name or
+  activation fails (warning on stderr) instead of aborting the whole
+  enumeration. If enumeration still fails as a whole after a hot-plug
+  notification, the GUI retries on the next frame instead of losing the
+  already drained change and reconciling against a stale device list.
 
 ## Original findings
 
@@ -309,9 +329,10 @@ These are not included in the eight primary findings.
   loses center/surround content instead of being downmixed; center-only
   dialogue can disappear. Either implement channel-mask-aware downmixing
   or clearly constrain source endpoints to mono/stereo.
-- config::save truncates the destination directly. Interrupted/concurrent
-  writes can destroy a previously valid configuration. Use an appropriate
-  atomic replacement strategy, and define concurrent-instance behavior.
+- (Fixed, see follow-up fixes.) config::save truncates the destination
+  directly. Interrupted/concurrent writes can destroy a previously valid
+  configuration. Use an appropriate atomic replacement strategy, and
+  define concurrent-instance behavior.
 - Runtime CLI gain changes are not saved on exit; persist_session runs
   before playback. Clarify this policy or persist the final gain values.
 - COM lifetime ordering in App is conditional: _com is declared before
@@ -323,9 +344,10 @@ These are not included in the eight primary findings.
 - Worker panics bypass the source stop store / renderer Failed update,
   and join errors are ignored. The health API can then report a live
   engine after its source died. Define panic-to-status handling.
-- list_render_devices aborts the whole enumeration when one endpoint's
-  name or activation fails. Consider retaining healthy endpoints and
-  surfacing a per-device error, especially during hot-plug races.
+- (Fixed, see follow-up fixes.) list_render_devices aborts the whole
+  enumeration when one endpoint's name or activation fails. Consider
+  retaining healthy endpoints and surfacing a per-device error,
+  especially during hot-plug races.
 - capture.rs and PLAN.md incorrectly describe lack of loopback events as
   a general limitation. Microsoft documents direct event-driven loopback
   support since Windows 10 version 1703; this project's minimum is 21H2.
