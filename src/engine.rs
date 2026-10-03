@@ -368,52 +368,73 @@ impl Drop for EngineHandle {
 /// render thread per target. Volume handles stay with the caller via the
 /// `Target`s; status is exposed through `EngineHandle::stats`.
 pub fn start(source: Source, targets: &[Target]) -> Result<EngineHandle> {
+    start_with_spawners(
+        source,
+        targets,
+        |target, handle| {
+            spawn_renderer(
+                target,
+                handle.source_rate,
+                &handle.ring,
+                &handle.sync,
+                &handle.stop,
+                true,
+            )
+        },
+        spawn_source,
+    )
+}
+
+/// Own every successfully spawned worker immediately. Any subsequent error
+/// drops this handle, signals stop, and joins the partial engine before the
+/// error reaches the caller. Factories allow deterministic spawn-failure tests.
+fn start_with_spawners(
+    source: Source,
+    targets: &[Target],
+    mut render_spawn: impl FnMut(&Target, &EngineHandle) -> Result<(RenderWorker, Arc<DeviceStats>)>,
+    source_spawn: impl FnOnce(Source, &EngineHandle) -> Result<thread::JoinHandle<()>>,
+) -> Result<EngineHandle> {
     let source_rate = match &source {
         Source::Loopback { sample_rate, .. } => *sample_rate,
         Source::Tone => TONE_RATE,
     };
-    let ring = Ring::new(source_rate as usize * RING_SECONDS);
-    let target_fill_frames = u64::from(source_rate) / TARGET_FILL_DIVISOR;
-    let sync = SyncBudget::new(target_fill_frames, targets.len());
-    let stop = Arc::new(AtomicBool::new(false));
-
-    let mut stats_list = Vec::new();
-    let mut renderers = Vec::new();
-    for target in targets {
-        let (worker, stats) = spawn_renderer(target, source_rate, &ring, &sync, &stop, true)?;
-        renderers.push(worker);
-        stats_list.push(stats);
-    }
-
-    let source_failure = Arc::new(WorkerFailure::default());
-    let source_handle = {
-        let ring = Arc::clone(&ring);
-        let stop = Arc::clone(&stop);
-        let failure = Arc::clone(&source_failure);
-        thread::Builder::new()
-            .name("source".to_string())
-            .spawn(move || {
-                failure.run_source(&stop, || match source {
-                    Source::Loopback {
-                        device_id,
-                        sample_rate,
-                    } => run_loopback_source(&device_id, sample_rate, &ring, &stop),
-                    Source::Tone => run_tone_source(&ring, &stop),
-                });
-            })
-            .context("spawning source thread")?
-    };
-    Ok(EngineHandle {
-        stop,
-        stats: stats_list,
-        threads: vec![source_handle],
-        renderers,
+    let mut handle = EngineHandle {
+        stop: Arc::new(AtomicBool::new(false)),
+        stats: Vec::new(),
+        threads: Vec::new(),
+        renderers: Vec::new(),
         retired: Vec::new(),
-        ring,
-        sync,
+        ring: Ring::new(source_rate as usize * RING_SECONDS),
+        sync: SyncBudget::new(u64::from(source_rate) / TARGET_FILL_DIVISOR, targets.len()),
         source_rate,
-        source_failure,
-    })
+        source_failure: Arc::new(WorkerFailure::default()),
+    };
+    for target in targets {
+        let (worker, stats) = render_spawn(target, &handle)?;
+        handle.renderers.push(worker);
+        handle.stats.push(stats);
+    }
+    let source_thread = source_spawn(source, &handle)?;
+    handle.threads.push(source_thread);
+    Ok(handle)
+}
+
+fn spawn_source(source: Source, handle: &EngineHandle) -> Result<thread::JoinHandle<()>> {
+    let ring = Arc::clone(&handle.ring);
+    let stop = Arc::clone(&handle.stop);
+    let failure = Arc::clone(&handle.source_failure);
+    thread::Builder::new()
+        .name("source".to_string())
+        .spawn(move || {
+            failure.run_source(&stop, || match source {
+                Source::Loopback {
+                    device_id,
+                    sample_rate,
+                } => run_loopback_source(&device_id, sample_rate, &ring, &stop),
+                Source::Tone => run_tone_source(&ring, &stop),
+            });
+        })
+        .context("spawning source thread")
 }
 
 fn spawn_renderer(
@@ -596,6 +617,105 @@ fn run_loopback_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Acknowledge that each fake worker really ran before returning it to
+    /// the engine. Completion counters prove rollback joined those workers.
+    fn synthetic_thread(
+        stop: &Arc<AtomicBool>,
+        completed: &Arc<AtomicUsize>,
+    ) -> thread::JoinHandle<()> {
+        let stop = Arc::clone(stop);
+        let completed = Arc::clone(completed);
+        let (ready, started) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            ready.send(()).unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                thread::yield_now();
+            }
+            completed.fetch_add(1, Ordering::SeqCst);
+        });
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker
+    }
+
+    fn synthetic_renderer(
+        target: &Target,
+        handle: &EngineHandle,
+        completed: &Arc<AtomicUsize>,
+    ) -> (RenderWorker, Arc<DeviceStats>) {
+        (
+            RenderWorker {
+                id: target.id.clone(),
+                stop: Arc::new(AtomicBool::new(false)),
+                thread: synthetic_thread(&handle.stop, completed),
+            },
+            Arc::new(DeviceStats::new(
+                target.name.clone(),
+                Arc::clone(&target.volume),
+            )),
+        )
+    }
+
+    #[test]
+    fn partial_start_joins_renderers_before_returning_spawn_error() {
+        let targets: Vec<Target> = ["a", "b"]
+            .into_iter()
+            .map(|id| Target {
+                id: id.into(),
+                name: id.into(),
+                volume: Volume::new(100),
+            })
+            .collect();
+        for fail_render in [true, false] {
+            let completed = Arc::new(AtomicUsize::new(0));
+            let result = start_with_spawners(
+                Source::Tone,
+                &targets,
+                |target, handle| {
+                    if fail_render && target.id == "b" {
+                        anyhow::bail!("injected render spawn failure");
+                    }
+                    Ok(synthetic_renderer(target, handle, &completed))
+                },
+                |_, _| anyhow::bail!("injected source spawn failure"),
+            );
+            let error = result.err().expect("start must fail").to_string();
+            assert_eq!(
+                error,
+                if fail_render {
+                    "injected render spawn failure"
+                } else {
+                    "injected source spawn failure"
+                }
+            );
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                if fail_render { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn complete_start_keeps_workers_until_explicit_stop() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let target = Target {
+            id: "a".into(),
+            name: "a".into(),
+            volume: Volume::new(100),
+        };
+        let handle = start_with_spawners(
+            Source::Tone,
+            &[target],
+            |target, handle| Ok(synthetic_renderer(target, handle, &completed)),
+            |_, handle| Ok(synthetic_thread(&handle.stop, &completed)),
+        )
+        .unwrap();
+        assert!(handle.is_running());
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        handle.stop().unwrap();
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+    }
 
     fn idle_handle() -> EngineHandle {
         EngineHandle {

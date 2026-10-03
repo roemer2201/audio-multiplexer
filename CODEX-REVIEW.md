@@ -31,47 +31,53 @@ behavior; P2 = functional or lifecycle bug to fix before a stable release.
 Hardware-dependent audible severity is explicitly distinguished below
 from the missing behavior visible in the code.
 
-## Findings
+## Remediation and validation
 
-## Fix progress
+The eight findings below are fixed on claude/review-fixes-2026-10-03,
+with one commit per finding. The original review descriptions and their
+line numbers are retained as a record of the reviewed state.
+
+A stable Rust toolchain was installed for remediation. All 18 portable
+core tests pass locally, and Windows cross-target Clippy checks all targets
+with warnings denied. Native Windows CI runs formatting, Clippy, build and
+unit tests on the pull request. R1 through R7 have passed that CI; the R8
+run follows its commit. No physical audio device tests, long-duration
+acoustic synchronization measurements or installer execution were performed.
 
 - R1: replaced equal ring-fill control with a shared playback-lag budget,
   IAudioClock/QPC measurement, queued-output accounting and resampler delay.
-  Four platform-independent timing tests pass. Hardware measurements remain
-  required; documentation distinguishes driver alignment from acoustic sync.
+  Four timing tests cover clock units, unequal output queues, rate conversion
+  and the preparation gate. Documentation separates driver-reported alignment
+  from physical acoustic synchronization.
 - R2: replaced polynomial interpolation with band-limited sinc conversion.
   The cutoff covers the full allowed drift range. Actual DSP tests preserve
   a 1 kHz passband tone and suppress selected alias tones at 48->44.1,
-  96->48 and 192->48 kHz, at both correction limits. All 10 core tests pass;
-  cross-target Windows Clippy is clean.
-- R4: GUI run intent is independent of the active engine handle. Losing
-  all targets leaves a waiting session; replug resumes it unless the user
-  pressed Stop. Three portable session tests cover last-target removal,
-  explicit Stop while waiting, and source availability. All 14 core tests
-  pass; cross-target Windows Clippy is clean.
+  96->48 and 192->48 kHz, including both correction limits.
 - R3: underrun and overwrite recovery share one reseek path that resets
   resampler history/ratio and ramps gain from zero. A dirty-state regression
-  test matches a fresh resampler after recovery. All 11 core tests pass;
-  cross-target Windows Clippy is clean.
-
-The findings below preserve the original reviewed state.
-
-- R6: explicit and restored CLI sessions now share volume validation and
-  override application. Restored overrides are session-only. Three native
-  unit tests cover valid overrides, invalid/non-target arguments, and both
-  selection modes without accessing audio hardware.
-
-- R5: target reconciliation now adds/removes individual render workers,
+  test matches a fresh resampler after recovery.
+- R4: GUI run intent is independent of the active engine handle. Losing
+  all targets leaves a waiting session; replug resumes it unless the user
+  pressed Stop. Session tests cover removal, Stop and source availability.
+- R5: target reconciliation adds/removes individual render workers,
   preserving the source, healthy reader positions and volumes. Removed
   workers are retired without joining a live worker in the GUI update;
-  stop observation is bounded to 50 ms without device events. A portable
-  target-delta test passes; a synthetic-worker isolation test is included
-  for native Windows CI. All 15 core tests pass and Windows Clippy is clean.
-
+  render event waits recheck stop every 50 ms. Target-delta and synthetic
+  worker tests verify that removing B leaves A running in the same thread.
+- R6: explicit and restored CLI sessions share volume validation and
+  override application. Restored overrides are session-only. Three tests
+  cover valid overrides, invalid/non-target arguments and both selection modes.
 - R7: source failures retain their full error chain, publish before stop,
   and propagate through CLI shutdown as a nonzero exit. GUI source/device
-  status includes the cause; panics become failed outcomes. Portable tests
-  inject open/start/drain failures, panic and normal stop.
+  status includes the cause; panics become failed outcomes. Tests inject
+  open/start/drain failures, panic and normal stop, and verify frontend
+  shutdown results and isolation of a single failed output.
+- R8: the engine owns each worker immediately after spawning it. A later
+  spawn error drops the partial engine, signals stop and joins every owned
+  thread before returning the error. Synthetic-worker tests inject second
+  renderer and source spawn failures and also verify successful startup.
+
+## Original findings
 
 ### R1 [P1] Equal ring fill does not align the actual playback positions
 
