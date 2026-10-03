@@ -15,6 +15,7 @@ use crate::config::{self, Config, TargetConfig};
 use crate::devices::{self, DeviceInfo};
 use crate::engine::{self, EngineHandle, Target, Volume};
 use crate::hotplug::HotplugWatcher;
+use crate::session::RunIntent;
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 const REPAINT_INTERVAL: Duration = Duration::from_millis(250);
@@ -65,6 +66,7 @@ struct App {
     config: Config,
     dirty_since: Option<Instant>,
     engine: Option<RunningEngine>,
+    run_intent: RunIntent,
     watcher: Option<HotplugWatcher>,
     last_error: Option<String>,
     /// Set when the engine stopped on its own (source failed/removed).
@@ -98,6 +100,7 @@ impl App {
             config,
             dirty_since: None,
             engine: None,
+            run_intent: RunIntent::default(),
             watcher,
             last_error,
             engine_notice: None,
@@ -162,6 +165,7 @@ impl App {
         let source = match self.effective_source() {
             Some(device) => device.clone(),
             None => {
+                self.run_intent.stop();
                 self.last_error =
                     Some("source device is not connected (or no default device)".to_string());
                 return;
@@ -169,7 +173,7 @@ impl App {
         };
         let desired = self.desired_target_ids();
         if desired.is_empty() {
-            self.last_error = Some("no connected target devices selected".to_string());
+            self.engine_notice = Some("waiting for configured target devices".to_string());
             return;
         }
         let mut targets = Vec::new();
@@ -203,7 +207,10 @@ impl App {
                     volumes: targets.iter().map(|t| Arc::clone(&t.volume)).collect(),
                 });
             }
-            Err(err) => self.last_error = Some(format!("engine start failed: {err:#}")),
+            Err(err) => {
+                self.run_intent.stop();
+                self.last_error = Some(format!("engine start failed: {err:#}"));
+            }
         }
     }
 
@@ -213,8 +220,19 @@ impl App {
         }
     }
 
+    fn request_start(&mut self) {
+        self.run_intent.start();
+        self.start_engine();
+    }
+
+    fn request_stop(&mut self) {
+        self.run_intent.stop();
+        self.engine_notice = None;
+        self.stop_engine();
+    }
+
     fn restart_engine_if_running(&mut self) {
-        if self.engine.is_some() {
+        if self.run_intent.requested() {
             self.stop_engine();
             self.start_engine();
         }
@@ -225,7 +243,16 @@ impl App {
     /// changed default device when it is the implicit source).
     fn reconcile_after_device_change(&mut self) {
         self.refresh_devices();
+        if !self.run_intent.requested() {
+            return;
+        }
         let Some(running) = &self.engine else {
+            if self.run_intent.should_resume(
+                self.effective_source().is_some(),
+                self.desired_target_ids().len(),
+            ) {
+                self.start_engine();
+            }
             return;
         };
         let source_changed =
@@ -246,6 +273,7 @@ impl App {
             .as_ref()
             .is_some_and(|running| !running.handle.is_running());
         if died {
+            self.run_intent.stop();
             self.stop_engine();
             self.engine_notice =
                 Some("engine stopped: the source failed or was removed".to_string());
@@ -417,14 +445,19 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading("Audio Multiplexer");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.engine.is_some() {
+                    if self.run_intent.requested() {
                         if ui.button("Stop").clicked() {
-                            self.stop_engine();
+                            self.request_stop();
                         }
-                        ui.colored_label(egui::Color32::from_rgb(64, 160, 64), "running");
+                        let label = if self.engine.is_some() {
+                            "running"
+                        } else {
+                            "waiting for targets"
+                        };
+                        ui.colored_label(egui::Color32::from_rgb(64, 160, 64), label);
                     } else {
                         if ui.button("Start").clicked() {
-                            self.start_engine();
+                            self.request_start();
                         }
                         ui.label("stopped");
                     }
@@ -470,7 +503,7 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.stop_engine();
+        self.request_stop();
         self.save_if_due(true);
     }
 }

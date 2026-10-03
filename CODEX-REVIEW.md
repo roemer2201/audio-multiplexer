@@ -44,6 +44,11 @@ from the missing behavior visible in the code.
   a 1 kHz passband tone and suppress selected alias tones at 48->44.1,
   96->48 and 192->48 kHz, at both correction limits. All 10 core tests pass;
   cross-target Windows Clippy is clean.
+- R4: GUI run intent is independent of the active engine handle. Losing
+  all targets leaves a waiting session; replug resumes it unless the user
+  pressed Stop. Three portable session tests cover last-target removal,
+  explicit Stop while waiting, and source availability. All 14 core tests
+  pass; cross-target Windows Clippy is clean.
 - R3: underrun and overwrite recovery share one reseek path that resets
   resampler history/ratio and ramps gain from zero. A dirty-state regression
   test matches a fresh resampler after recovery. All 11 core tests pass;

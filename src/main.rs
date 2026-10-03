@@ -11,6 +11,7 @@ mod hotplug;
 mod render;
 mod resample;
 mod ring;
+mod session;
 mod sync;
 mod tone;
 

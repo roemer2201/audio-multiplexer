@@ -2,4 +2,5 @@
 
 pub mod resample;
 pub mod ring;
+pub mod session;
 pub mod sync;
