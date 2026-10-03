@@ -69,6 +69,9 @@ struct App {
     run_intent: RunIntent,
     retired_engines: Vec<EngineHandle>,
     watcher: Option<HotplugWatcher>,
+    /// A device change whose re-enumeration failed; retried every frame,
+    /// because the watcher notifications were already drained.
+    device_change_pending: bool,
     last_error: Option<String>,
     /// Set when the engine stopped on its own (source failed/removed).
     engine_notice: Option<String>,
@@ -104,6 +107,7 @@ impl App {
             run_intent: RunIntent::default(),
             retired_engines: Vec::new(),
             watcher,
+            device_change_pending: false,
             last_error,
             engine_notice: None,
         };
@@ -111,10 +115,17 @@ impl App {
         app
     }
 
-    fn refresh_devices(&mut self) {
+    /// Returns false if enumeration failed and the device list is stale.
+    fn refresh_devices(&mut self) -> bool {
         match devices::list_render_devices() {
-            Ok(devices) => self.devices = devices,
-            Err(err) => self.last_error = Some(format!("device enumeration failed: {err}")),
+            Ok(devices) => {
+                self.devices = devices;
+                true
+            }
+            Err(err) => {
+                self.last_error = Some(format!("device enumeration failed: {err}"));
+                false
+            }
         }
     }
 
@@ -305,8 +316,9 @@ impl App {
     /// running engine (rejoin replugged targets, drop removed ones, follow a
     /// changed default device when it is the implicit source).
     fn reconcile_after_device_change(&mut self) {
-        self.refresh_devices();
-        if !self.run_intent.requested() {
+        // Reconciling against a stale list would miss the change entirely.
+        self.device_change_pending = !self.refresh_devices();
+        if self.device_change_pending || !self.run_intent.requested() {
             return;
         }
         let Some(running) = &self.engine else {
@@ -505,7 +517,8 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.reap_stopped_engines();
-        if self.watcher.as_ref().is_some_and(|w| w.take_changes()) {
+        let notified = self.watcher.as_ref().is_some_and(|w| w.take_changes());
+        if notified || self.device_change_pending {
             self.reconcile_after_device_change();
         }
         self.poll_engine_health();
