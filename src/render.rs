@@ -181,7 +181,9 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
         if rebuffering {
             if params.sync.ready() && reader.available() >= ring_target {
                 reader.seek_to_latest(ring_target);
+                resample::reset_for_reseek(&mut resampler);
                 controller.reset();
+                current_gain = 0.0;
                 rebuffering = false;
                 stats.set_state(EngineState::Running);
             } else {
@@ -207,8 +209,10 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
             }
             Err(ReadError::Overwritten) => {
                 stats.add_overrun();
-                reader.seek_to_latest(ring_target);
-                controller.reset();
+                // Use the same recovery path as an underrun. The next
+                // successful latch resets history, ratio and gain together.
+                stats.set_state(EngineState::Rebuffering);
+                rebuffering = true;
                 write_silence(&render, frames_out)?;
                 submitted_frames += f64::from(frames_out);
                 continue;

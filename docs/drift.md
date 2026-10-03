@@ -88,7 +88,10 @@ Underruns (capture gaps, see loopback notes in `src/capture.rs`) pause
 the controller: the render thread enters a rebuffering state, plays
 silence, waits until enough input is available again, re-latches with its
 own output-pipeline delay subtracted from the shared budget, and resets
-the controller.
+the controller. Every reseek also clears the resampler history, restores
+its nominal ratio, and restarts a short gain fade. Chunk size and required
+input length are queried after the reset, so old interpolation data is
+never mixed into the new source timeline.
 This prevents integral windup from gaps in the capture timeline.
 
 ## Measuring sync between two devices

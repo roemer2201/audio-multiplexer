@@ -5,7 +5,7 @@
 //! the effective output Nyquist frequency.
 
 use rubato::{
-    Async, FixedAsync, ResamplerConstructionError, SincInterpolationParameters,
+    Async, FixedAsync, Resampler, ResamplerConstructionError, SincInterpolationParameters,
     SincInterpolationType, WindowFunction, calculate_cutoff,
 };
 
@@ -43,6 +43,12 @@ pub fn new(
         CHANNELS,
         FixedAsync::Output,
     )
+}
+
+/// A reader jump starts a new signal timeline. Interpolation history, ratio,
+/// and chunk sizing must all be rebuilt before querying input_frames_next.
+pub fn reset_for_reseek(resampler: &mut Async<f32>) {
+    resampler.reset();
 }
 
 #[cfg(test)]
@@ -118,6 +124,48 @@ mod tests {
                     "{source}->{device}, correction={correction}: alias RMS {rms}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn recovery_matches_a_fresh_resampler_without_an_old_signal_tail() {
+        let mut used = new(48000, 44100, 480).unwrap();
+        used.set_resample_ratio_relative(0.99, false).unwrap();
+        let frames = used.input_frames_next();
+        let old = vec![1.0; frames * CHANNELS];
+        let input = InterleavedSlice::new(&old, CHANNELS, frames).unwrap();
+        let mut output = vec![0.0; 480 * CHANNELS];
+        let mut adapter = InterleavedSlice::new_mut(&mut output, CHANNELS, 480).unwrap();
+        used.process_into_buffer(&input, &mut adapter, None)
+            .unwrap();
+        used.set_chunk_size(240).unwrap();
+        reset_for_reseek(&mut used);
+
+        let mut fresh = new(48000, 44100, 480).unwrap();
+        assert_eq!(used.resample_ratio(), fresh.resample_ratio());
+        for block in 0..3 {
+            used.set_chunk_size(240).unwrap();
+            fresh.set_chunk_size(240).unwrap();
+            assert_eq!(used.input_frames_next(), fresh.input_frames_next());
+            let frames = used.input_frames_next();
+            let signal = vec![if block == 0 { 0.0 } else { -0.5 }; frames * CHANNELS];
+            let input = InterleavedSlice::new(&signal, CHANNELS, frames).unwrap();
+            let mut actual = vec![0.0; 240 * CHANNELS];
+            let mut expected = vec![0.0; 240 * CHANNELS];
+            used.process_into_buffer(
+                &input,
+                &mut InterleavedSlice::new_mut(&mut actual, CHANNELS, 240).unwrap(),
+                None,
+            )
+            .unwrap();
+            fresh
+                .process_into_buffer(
+                    &input,
+                    &mut InterleavedSlice::new_mut(&mut expected, CHANNELS, 240).unwrap(),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(actual, expected);
         }
     }
 }

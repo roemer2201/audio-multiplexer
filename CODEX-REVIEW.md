@@ -44,6 +44,10 @@ from the missing behavior visible in the code.
   a 1 kHz passband tone and suppress selected alias tones at 48->44.1,
   96->48 and 192->48 kHz, at both correction limits. All 10 core tests pass;
   cross-target Windows Clippy is clean.
+- R3: underrun and overwrite recovery share one reseek path that resets
+  resampler history/ratio and ramps gain from zero. A dirty-state regression
+  test matches a fresh resampler after recovery. All 11 core tests pass;
+  cross-target Windows Clippy is clean.
 
 The findings below preserve the original reviewed state.
 
