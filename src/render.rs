@@ -57,6 +57,8 @@ pub struct RenderParams {
     pub device_id: String,
     pub source_rate: u32,
     pub sync: Arc<SyncBudget>,
+    pub initial_target: bool,
+    pub engine_stop: Arc<AtomicBool>,
     pub volume: Arc<Volume>,
     pub stats: Arc<DeviceStats>,
 }
@@ -73,7 +75,7 @@ impl Drop for EventHandle {
 }
 
 pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> Result<()> {
-    let preparation = params.sync.preparation();
+    let preparation = params.initial_target.then(|| params.sync.preparation());
     let stats = &params.stats;
     let _com = ComGuard::new()?;
     let device = devices::get_device(&params.device_id).context("opening target device")?;
@@ -144,9 +146,11 @@ pub fn run(params: RenderParams, mut reader: Reader, stop: Arc<AtomicBool>) -> R
     let gain_step = 1.0 / (GAIN_RAMP_SECONDS * device_rate as f32);
     let mut current_gain = params.volume.gain();
 
-    while !stop.load(Ordering::Relaxed) {
-        let wait = unsafe { WaitForSingleObject(event.0, 2000) };
-        if stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && !params.engine_stop.load(Ordering::Relaxed) {
+        // Device events may disappear on removal. Bound stop observation
+        // even then; retired workers are joined only after completion.
+        let wait = unsafe { WaitForSingleObject(event.0, 50) };
+        if stop.load(Ordering::Relaxed) || params.engine_stop.load(Ordering::Relaxed) {
             break;
         }
         if wait == WAIT_FAILED {

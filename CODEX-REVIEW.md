@@ -56,6 +56,13 @@ from the missing behavior visible in the code.
 
 The findings below preserve the original reviewed state.
 
+- R5: target reconciliation now adds/removes individual render workers,
+  preserving the source, healthy reader positions and volumes. Removed
+  workers are retired without joining a live worker in the GUI update;
+  stop observation is bounded to 50 ms without device events. A portable
+  target-delta test passes; a synthetic-worker isolation test is included
+  for native Windows CI. All 15 core tests pass and Windows Clippy is clean.
+
 ### R1 [P1] Equal ring fill does not align the actual playback positions
 
 Location: src/render.rs:148-160, 206-222; src/engine.rs:24-27, 238-239.

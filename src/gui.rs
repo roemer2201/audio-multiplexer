@@ -67,6 +67,7 @@ struct App {
     dirty_since: Option<Instant>,
     engine: Option<RunningEngine>,
     run_intent: RunIntent,
+    retired_engines: Vec<EngineHandle>,
     watcher: Option<HotplugWatcher>,
     last_error: Option<String>,
     /// Set when the engine stopped on its own (source failed/removed).
@@ -101,6 +102,7 @@ impl App {
             dirty_since: None,
             engine: None,
             run_intent: RunIntent::default(),
+            retired_engines: Vec::new(),
             watcher,
             last_error,
             engine_notice: None,
@@ -176,21 +178,7 @@ impl App {
             self.engine_notice = Some("waiting for configured target devices".to_string());
             return;
         }
-        let mut targets = Vec::new();
-        for id in &desired {
-            let name = self
-                .devices
-                .iter()
-                .find(|d| &d.id == id)
-                .map(|d| d.name.clone())
-                .unwrap_or_default();
-            let volume = self.config.target(id).map(|t| t.volume).unwrap_or(100);
-            targets.push(Target {
-                id: id.clone(),
-                name,
-                volume: Volume::new(volume),
-            });
-        }
+        let targets = self.configured_targets();
         match engine::start(
             engine::Source::Loopback {
                 device_id: source.id.clone(),
@@ -214,9 +202,31 @@ impl App {
         }
     }
 
+    fn configured_targets(&self) -> Vec<Target> {
+        let mut targets = Vec::new();
+        for id in self.desired_target_ids() {
+            let name = self
+                .devices
+                .iter()
+                .find(|d| d.id == id)
+                .map(|d| d.name.clone())
+                .unwrap_or_default();
+            let percent = self.config.target(&id).map(|t| t.volume).unwrap_or(100);
+            let volume = self
+                .engine
+                .as_ref()
+                .and_then(|running| running.volume_for(&id))
+                .cloned()
+                .unwrap_or_else(|| Volume::new(percent));
+            targets.push(Target { id, name, volume });
+        }
+        targets
+    }
+
     fn stop_engine(&mut self) {
         if let Some(running) = self.engine.take() {
-            running.handle.stop();
+            running.handle.request_stop();
+            self.retired_engines.push(running.handle);
         }
     }
 
@@ -235,6 +245,57 @@ impl App {
         if self.run_intent.requested() {
             self.stop_engine();
             self.start_engine();
+        }
+    }
+
+    fn reconcile_targets(&mut self) {
+        if !self.run_intent.requested() {
+            return;
+        }
+        let targets = self.configured_targets();
+        let Some(running) = &mut self.engine else {
+            if !targets.is_empty() {
+                self.start_engine();
+            }
+            return;
+        };
+        if let Err(err) = running.handle.reconcile_targets(&targets) {
+            self.last_error = Some(format!("target change failed: {err:#}"));
+        }
+        running.target_ids = running.handle.target_ids();
+        running.volumes = running
+            .target_ids
+            .iter()
+            .map(|id| {
+                Arc::clone(
+                    &targets
+                        .iter()
+                        .find(|t| &t.id == id)
+                        .expect("active target configured")
+                        .volume,
+                )
+            })
+            .collect();
+        self.engine_notice = if running.target_ids.is_empty() {
+            Some("waiting for configured target devices".to_string())
+        } else {
+            None
+        };
+    }
+
+    /// No running audio worker is joined from a GUI event. Retired handles
+    /// are collected after completion; closing the app waits for shutdown.
+    fn reap_stopped_engines(&mut self) {
+        if let Some(running) = &mut self.engine {
+            running.handle.reap_finished();
+        }
+        let mut index = 0;
+        while index < self.retired_engines.len() {
+            if self.retired_engines[index].is_finished() {
+                self.retired_engines.swap_remove(index).stop();
+            } else {
+                index += 1;
+            }
         }
     }
 
@@ -257,12 +318,10 @@ impl App {
         };
         let source_changed =
             self.effective_source().map(|d| d.id.as_str()) != Some(running.source_id.as_str());
-        let mut desired = self.desired_target_ids();
-        let mut active = running.target_ids.clone();
-        desired.sort();
-        active.sort();
-        if source_changed || desired != active {
+        if source_changed {
             self.restart_engine_if_running();
+        } else {
+            self.reconcile_targets();
         }
     }
 
@@ -294,7 +353,7 @@ impl App {
             self.config.targets.retain(|t| t.id != device.id);
         }
         self.mark_dirty();
-        self.restart_engine_if_running();
+        self.reconcile_targets();
     }
 
     fn set_target_volume(&mut self, device_id: &str, percent: u8) {
@@ -436,6 +495,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.reap_stopped_engines();
         if self.watcher.as_ref().is_some_and(|w| w.take_changes()) {
             self.reconcile_after_device_change();
         }
@@ -449,7 +509,11 @@ impl eframe::App for App {
                         if ui.button("Stop").clicked() {
                             self.request_stop();
                         }
-                        let label = if self.engine.is_some() {
+                        let label = if self
+                            .engine
+                            .as_ref()
+                            .is_some_and(|r| !r.target_ids.is_empty())
+                        {
                             "running"
                         } else {
                             "waiting for targets"
@@ -504,6 +568,11 @@ impl eframe::App for App {
 impl Drop for App {
     fn drop(&mut self) {
         self.request_stop();
+        for handle in self.retired_engines.drain(..) {
+            handle.stop();
+        }
+        // Callback unregistration must precede release of the COM guard.
+        self.watcher.take();
         self.save_if_due(true);
     }
 }

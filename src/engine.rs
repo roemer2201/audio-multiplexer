@@ -16,6 +16,7 @@ use crate::capture::{LoopbackCapture, POLL_INTERVAL};
 use crate::com::ComGuard;
 use crate::render::{self, RenderParams};
 use crate::ring::Ring;
+use crate::session::TargetChanges;
 use crate::sync::SyncBudget;
 use crate::tone::{TONE_RATE, run_tone_source};
 
@@ -186,11 +187,95 @@ pub struct EngineHandle {
     stop: Arc<AtomicBool>,
     stats: Vec<Arc<DeviceStats>>,
     threads: Vec<thread::JoinHandle<()>>,
+    renderers: Vec<RenderWorker>,
+    retired: Vec<thread::JoinHandle<()>>,
+    ring: Arc<Ring>,
+    sync: Arc<SyncBudget>,
+    source_rate: u32,
+}
+
+struct RenderWorker {
+    id: String,
+    stop: Arc<AtomicBool>,
+    thread: thread::JoinHandle<()>,
 }
 
 impl EngineHandle {
-    /// Per-target statistics, index-aligned with the targets passed to
-    /// `start`.
+    pub fn target_ids(&self) -> Vec<String> {
+        self.renderers
+            .iter()
+            .map(|worker| worker.id.clone())
+            .collect()
+    }
+
+    /// Reconcile only output workers. Source and healthy readers keep their
+    /// stream positions and controller state across another device's rejoin.
+    pub fn reconcile_targets(&mut self, targets: &[Target]) -> Result<()> {
+        let desired: Vec<String> = targets.iter().map(|t| t.id.clone()).collect();
+        // A coalesced unplug/replug can leave IDs unchanged but workers dead.
+        let failed: Vec<String> = self
+            .renderers
+            .iter()
+            .enumerate()
+            .filter(|(i, w)| {
+                w.thread.is_finished() || self.stats[*i].state() == EngineState::Failed
+            })
+            .map(|(_, w)| w.id.clone())
+            .collect();
+        for id in failed {
+            self.remove_target(&id);
+        }
+        let changes = TargetChanges::between(&self.target_ids(), &desired);
+        for id in changes.remove {
+            self.remove_target(&id);
+        }
+        for id in changes.add {
+            let target = targets
+                .iter()
+                .find(|t| t.id == id)
+                .expect("desired target exists");
+            let (worker, stats) = spawn_renderer(
+                target,
+                self.source_rate,
+                &self.ring,
+                &self.sync,
+                &self.stop,
+                false,
+            )?;
+            self.renderers.push(worker);
+            self.stats.push(stats);
+        }
+        self.reap_finished();
+        Ok(())
+    }
+
+    fn remove_target(&mut self, id: &str) {
+        if let Some(index) = self.renderers.iter().position(|worker| worker.id == id) {
+            let worker = self.renderers.remove(index);
+            worker.stop.store(true, Ordering::Relaxed);
+            self.retired.push(worker.thread);
+            self.stats.remove(index);
+        }
+    }
+
+    pub fn reap_finished(&mut self) {
+        let mut index = 0;
+        while index < self.retired.len() {
+            if self.retired[index].is_finished() {
+                let _ = self.retired.swap_remove(index).join();
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.threads.iter().all(thread::JoinHandle::is_finished)
+            && self.renderers.iter().all(|w| w.thread.is_finished())
+            && self.retired.iter().all(thread::JoinHandle::is_finished)
+    }
+
+    /// Per-target statistics, index-aligned with current target_ids().
     pub fn stats(&self) -> &[Arc<DeviceStats>] {
         &self.stats
     }
@@ -219,6 +304,12 @@ impl EngineHandle {
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
+        for worker in self.renderers.drain(..) {
+            let _ = worker.thread.join();
+        }
+        for handle in self.retired.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -242,32 +333,11 @@ pub fn start(source: Source, targets: &[Target]) -> Result<EngineHandle> {
     let stop = Arc::new(AtomicBool::new(false));
 
     let mut stats_list = Vec::new();
-    let mut threads = Vec::new();
+    let mut renderers = Vec::new();
     for target in targets {
-        let stats = Arc::new(DeviceStats::new(
-            target.name.clone(),
-            Arc::clone(&target.volume),
-        ));
-        stats_list.push(Arc::clone(&stats));
-        let params = RenderParams {
-            device_id: target.id.clone(),
-            source_rate,
-            sync: Arc::clone(&sync),
-            volume: Arc::clone(&target.volume),
-            stats: Arc::clone(&stats),
-        };
-        let reader = ring.reader();
-        let stop = Arc::clone(&stop);
-        let handle = thread::Builder::new()
-            .name(format!("render {}", target.name))
-            .spawn(move || {
-                if let Err(err) = render::run(params, reader, stop) {
-                    stats.set_state(EngineState::Failed);
-                    eprintln!("render device '{}' failed: {err:#}", stats.name);
-                }
-            })
-            .context("spawning render thread")?;
-        threads.push(handle);
+        let (worker, stats) = spawn_renderer(target, source_rate, &ring, &sync, &stop, true)?;
+        renderers.push(worker);
+        stats_list.push(stats);
     }
 
     let source_handle = {
@@ -291,13 +361,60 @@ pub fn start(source: Source, targets: &[Target]) -> Result<EngineHandle> {
             })
             .context("spawning source thread")?
     };
-    threads.push(source_handle);
-
     Ok(EngineHandle {
         stop,
         stats: stats_list,
-        threads,
+        threads: vec![source_handle],
+        renderers,
+        retired: Vec::new(),
+        ring,
+        sync,
+        source_rate,
     })
+}
+
+fn spawn_renderer(
+    target: &Target,
+    source_rate: u32,
+    ring: &Arc<Ring>,
+    sync: &Arc<SyncBudget>,
+    engine_stop: &Arc<AtomicBool>,
+    initial_target: bool,
+) -> Result<(RenderWorker, Arc<DeviceStats>)> {
+    let stats = Arc::new(DeviceStats::new(
+        target.name.clone(),
+        Arc::clone(&target.volume),
+    ));
+    let params = RenderParams {
+        device_id: target.id.clone(),
+        source_rate,
+        sync: Arc::clone(sync),
+        initial_target,
+        engine_stop: Arc::clone(engine_stop),
+        volume: Arc::clone(&target.volume),
+        stats: Arc::clone(&stats),
+    };
+    let reader = ring.reader();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let worker_stats = Arc::clone(&stats);
+    let thread = thread::Builder::new()
+        .name(format!("render {}", target.name))
+        .spawn(move || {
+            if let Err(err) = render::run(params, reader, worker_stop) {
+                worker_stats.set_state(EngineState::Failed);
+                eprintln!("render device '{}' failed: {err:#}", worker_stats.name);
+            }
+        })
+        .context("spawning render thread")?;
+    Ok((
+        RenderWorker {
+            id: target.id.clone(),
+            stop,
+            thread,
+        },
+        stats,
+    ))
 }
 
 /// Blocking CLI frontend: runs the engine until Enter is pressed, `seconds`
@@ -423,4 +540,69 @@ fn run_loopback_source(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exercise actual worker reconciliation with synthetic workers, so no
+    /// audio device is needed even when this test runs in Windows CI.
+    #[test]
+    fn removing_one_worker_does_not_stop_or_replace_the_other() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let volume = Volume::new(100);
+        let make_worker = |id: &str, progress: Arc<AtomicU64>| {
+            let local_stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&local_stop);
+            let engine_stop = Arc::clone(&stop);
+            RenderWorker {
+                id: id.into(),
+                stop: local_stop,
+                thread: thread::spawn(move || {
+                    while !worker_stop.load(Ordering::Relaxed)
+                        && !engine_stop.load(Ordering::Relaxed)
+                    {
+                        progress.fetch_add(1, Ordering::Relaxed);
+                        thread::yield_now();
+                    }
+                }),
+            }
+        };
+        let a = make_worker("a", Arc::clone(&progress));
+        let a_thread = a.thread.thread().id();
+        let b = make_worker("b", Arc::new(AtomicU64::new(0)));
+        let b_stop = Arc::clone(&b.stop);
+        let mut handle = EngineHandle {
+            stop: Arc::clone(&stop),
+            stats: vec![
+                Arc::new(DeviceStats::new("a".into(), Arc::clone(&volume))),
+                Arc::new(DeviceStats::new("b".into(), Arc::clone(&volume))),
+            ],
+            threads: Vec::new(),
+            renderers: vec![a, b],
+            retired: Vec::new(),
+            ring: Ring::new(TONE_RATE as usize * RING_SECONDS),
+            sync: SyncBudget::new(4800, 0),
+            source_rate: TONE_RATE,
+        };
+        let before = progress.load(Ordering::Relaxed);
+        handle
+            .reconcile_targets(&[Target {
+                id: "a".into(),
+                name: "a".into(),
+                volume,
+            }])
+            .unwrap();
+        assert!(b_stop.load(Ordering::Relaxed));
+        assert!(!stop.load(Ordering::Relaxed));
+        assert_eq!(handle.renderers[0].thread.thread().id(), a_thread);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while progress.load(Ordering::Relaxed) <= before && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(progress.load(Ordering::Relaxed) > before);
+        handle.stop();
+    }
 }
