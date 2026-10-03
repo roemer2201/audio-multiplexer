@@ -15,6 +15,7 @@ use crate::config::{self, Config, TargetConfig};
 use crate::devices::{self, DeviceInfo};
 use crate::engine::{self, EngineHandle, Target, Volume};
 use crate::hotplug::HotplugWatcher;
+use crate::session::RunIntent;
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 const REPAINT_INTERVAL: Duration = Duration::from_millis(250);
@@ -65,7 +66,12 @@ struct App {
     config: Config,
     dirty_since: Option<Instant>,
     engine: Option<RunningEngine>,
+    run_intent: RunIntent,
+    retired_engines: Vec<EngineHandle>,
     watcher: Option<HotplugWatcher>,
+    /// A device change whose re-enumeration failed; retried every frame,
+    /// because the watcher notifications were already drained.
+    device_change_pending: bool,
     last_error: Option<String>,
     /// Set when the engine stopped on its own (source failed/removed).
     engine_notice: Option<String>,
@@ -98,7 +104,10 @@ impl App {
             config,
             dirty_since: None,
             engine: None,
+            run_intent: RunIntent::default(),
+            retired_engines: Vec::new(),
             watcher,
+            device_change_pending: false,
             last_error,
             engine_notice: None,
         };
@@ -106,10 +115,17 @@ impl App {
         app
     }
 
-    fn refresh_devices(&mut self) {
+    /// Returns false if enumeration failed and the device list is stale.
+    fn refresh_devices(&mut self) -> bool {
         match devices::list_render_devices() {
-            Ok(devices) => self.devices = devices,
-            Err(err) => self.last_error = Some(format!("device enumeration failed: {err}")),
+            Ok(devices) => {
+                self.devices = devices;
+                true
+            }
+            Err(err) => {
+                self.last_error = Some(format!("device enumeration failed: {err}"));
+                false
+            }
         }
     }
 
@@ -162,6 +178,7 @@ impl App {
         let source = match self.effective_source() {
             Some(device) => device.clone(),
             None => {
+                self.run_intent.stop();
                 self.last_error =
                     Some("source device is not connected (or no default device)".to_string());
                 return;
@@ -169,24 +186,10 @@ impl App {
         };
         let desired = self.desired_target_ids();
         if desired.is_empty() {
-            self.last_error = Some("no connected target devices selected".to_string());
+            self.engine_notice = Some("waiting for configured target devices".to_string());
             return;
         }
-        let mut targets = Vec::new();
-        for id in &desired {
-            let name = self
-                .devices
-                .iter()
-                .find(|d| &d.id == id)
-                .map(|d| d.name.clone())
-                .unwrap_or_default();
-            let volume = self.config.target(id).map(|t| t.volume).unwrap_or(100);
-            targets.push(Target {
-                id: id.clone(),
-                name,
-                volume: Volume::new(volume),
-            });
-        }
+        let targets = self.configured_targets();
         match engine::start(
             engine::Source::Loopback {
                 device_id: source.id.clone(),
@@ -203,20 +206,109 @@ impl App {
                     volumes: targets.iter().map(|t| Arc::clone(&t.volume)).collect(),
                 });
             }
-            Err(err) => self.last_error = Some(format!("engine start failed: {err:#}")),
+            Err(err) => {
+                self.run_intent.stop();
+                self.last_error = Some(format!("engine start failed: {err:#}"));
+            }
         }
+    }
+
+    fn configured_targets(&self) -> Vec<Target> {
+        let mut targets = Vec::new();
+        for id in self.desired_target_ids() {
+            let name = self
+                .devices
+                .iter()
+                .find(|d| d.id == id)
+                .map(|d| d.name.clone())
+                .unwrap_or_default();
+            let percent = self.config.target(&id).map(|t| t.volume).unwrap_or(100);
+            let volume = self
+                .engine
+                .as_ref()
+                .and_then(|running| running.volume_for(&id))
+                .cloned()
+                .unwrap_or_else(|| Volume::new(percent));
+            targets.push(Target { id, name, volume });
+        }
+        targets
     }
 
     fn stop_engine(&mut self) {
         if let Some(running) = self.engine.take() {
-            running.handle.stop();
+            running.handle.request_stop();
+            self.retired_engines.push(running.handle);
         }
     }
 
+    fn request_start(&mut self) {
+        self.run_intent.start();
+        self.start_engine();
+    }
+
+    fn request_stop(&mut self) {
+        self.run_intent.stop();
+        self.engine_notice = None;
+        self.stop_engine();
+    }
+
     fn restart_engine_if_running(&mut self) {
-        if self.engine.is_some() {
+        if self.run_intent.requested() {
             self.stop_engine();
             self.start_engine();
+        }
+    }
+
+    fn reconcile_targets(&mut self) {
+        if !self.run_intent.requested() {
+            return;
+        }
+        let targets = self.configured_targets();
+        let Some(running) = &mut self.engine else {
+            if !targets.is_empty() {
+                self.start_engine();
+            }
+            return;
+        };
+        if let Err(err) = running.handle.reconcile_targets(&targets) {
+            self.last_error = Some(format!("target change failed: {err:#}"));
+        }
+        running.target_ids = running.handle.target_ids();
+        running.volumes = running
+            .target_ids
+            .iter()
+            .map(|id| {
+                Arc::clone(
+                    &targets
+                        .iter()
+                        .find(|t| &t.id == id)
+                        .expect("active target configured")
+                        .volume,
+                )
+            })
+            .collect();
+        self.engine_notice = if running.target_ids.is_empty() {
+            Some("waiting for configured target devices".to_string())
+        } else {
+            None
+        };
+    }
+
+    /// No running audio worker is joined from a GUI event. Retired handles
+    /// are collected after completion; closing the app waits for shutdown.
+    fn reap_stopped_engines(&mut self) {
+        if let Some(running) = &mut self.engine {
+            running.handle.reap_finished();
+        }
+        let mut index = 0;
+        while index < self.retired_engines.len() {
+            if self.retired_engines[index].is_finished() {
+                if let Err(error) = self.retired_engines.swap_remove(index).stop() {
+                    self.engine_notice = Some(format!("engine stopped: {error:#}"));
+                }
+            } else {
+                index += 1;
+            }
         }
     }
 
@@ -224,18 +316,26 @@ impl App {
     /// running engine (rejoin replugged targets, drop removed ones, follow a
     /// changed default device when it is the implicit source).
     fn reconcile_after_device_change(&mut self) {
-        self.refresh_devices();
+        // Reconciling against a stale list would miss the change entirely.
+        self.device_change_pending = !self.refresh_devices();
+        if self.device_change_pending || !self.run_intent.requested() {
+            return;
+        }
         let Some(running) = &self.engine else {
+            if self.run_intent.should_resume(
+                self.effective_source().is_some(),
+                self.desired_target_ids().len(),
+            ) {
+                self.start_engine();
+            }
             return;
         };
         let source_changed =
             self.effective_source().map(|d| d.id.as_str()) != Some(running.source_id.as_str());
-        let mut desired = self.desired_target_ids();
-        let mut active = running.target_ids.clone();
-        desired.sort();
-        active.sort();
-        if source_changed || desired != active {
+        if source_changed {
             self.restart_engine_if_running();
+        } else {
+            self.reconcile_targets();
         }
     }
 
@@ -246,9 +346,14 @@ impl App {
             .as_ref()
             .is_some_and(|running| !running.handle.is_running());
         if died {
+            let error = self
+                .engine
+                .as_ref()
+                .and_then(|e| e.handle.failure())
+                .unwrap_or_else(|| "the source stopped".into());
+            self.run_intent.stop();
             self.stop_engine();
-            self.engine_notice =
-                Some("engine stopped: the source failed or was removed".to_string());
+            self.engine_notice = Some(format!("engine stopped: {error}"));
         }
     }
 
@@ -266,7 +371,7 @@ impl App {
             self.config.targets.retain(|t| t.id != device.id);
         }
         self.mark_dirty();
-        self.restart_engine_if_running();
+        self.reconcile_targets();
     }
 
     fn set_target_volume(&mut self, device_id: &str, percent: u8) {
@@ -402,13 +507,18 @@ impl App {
                 stats.underruns(),
                 stats.overruns()
             ));
+            if let Some(error) = stats.failure() {
+                ui.colored_label(egui::Color32::RED, error);
+            }
         }
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.watcher.as_ref().is_some_and(|w| w.take_changes()) {
+        self.reap_stopped_engines();
+        let notified = self.watcher.as_ref().is_some_and(|w| w.take_changes());
+        if notified || self.device_change_pending {
             self.reconcile_after_device_change();
         }
         self.poll_engine_health();
@@ -417,14 +527,23 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.heading("Audio Multiplexer");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.engine.is_some() {
+                    if self.run_intent.requested() {
                         if ui.button("Stop").clicked() {
-                            self.stop_engine();
+                            self.request_stop();
                         }
-                        ui.colored_label(egui::Color32::from_rgb(64, 160, 64), "running");
+                        let label = if self
+                            .engine
+                            .as_ref()
+                            .is_some_and(|r| !r.target_ids.is_empty())
+                        {
+                            "running"
+                        } else {
+                            "waiting for targets"
+                        };
+                        ui.colored_label(egui::Color32::from_rgb(64, 160, 64), label);
                     } else {
                         if ui.button("Start").clicked() {
-                            self.start_engine();
+                            self.request_start();
                         }
                         ui.label("stopped");
                     }
@@ -470,7 +589,13 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.stop_engine();
+        self.request_stop();
+        for handle in self.retired_engines.drain(..) {
+            // Closing the app has no remaining UI to display an outcome.
+            let _ = handle.stop();
+        }
+        // Callback unregistration must precede release of the COM guard.
+        self.watcher.take();
         self.save_if_due(true);
     }
 }

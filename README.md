@@ -7,7 +7,10 @@ audio on multiple physical output devices simultaneously and in sync
 Applications play into a silent virtual audio device; audio-multiplexer
 captures that endpoint via WASAPI loopback and renders the stream to N
 user-selected real devices, with per-device volume and clock-drift
-compensation.
+compensation. Playback alignment uses driver-reported device clocks and
+accounts for queued output and resampler delay. Physical synchronization
+still requires hardware validation; Bluetooth transport or speaker DSP
+latency not reported by the driver can leave an audible offset.
 
 ## Status
 
@@ -103,6 +106,10 @@ where `<target#>` is the index shown in the status lines.
 `play` with explicit `--target` arguments saves the session to the
 config file; `play` without targets restores it (unplugged devices
 are skipped with a warning but stay configured).
+
+`--volume` is validated and applied in both modes. With restored targets
+it overrides the saved volume for this run only; with explicit targets
+the selected session, including initial volumes, is saved as before.
 
 Notes:
 
