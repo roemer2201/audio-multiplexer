@@ -136,24 +136,21 @@ fn cmd_play(
     seconds: Option<u64>,
 ) -> Result<()> {
     let devices = enumerate()?;
-    let (source, targets) = if target_args.is_empty() {
-        restore_session(source_arg.as_deref(), &devices)?
+    let saved = if target_args.is_empty() {
+        config::load()?
     } else {
-        let source = resolve_source(source_arg.as_deref(), &devices)?.clone();
-        let targets = resolve_targets(&target_args, &devices)?;
-        apply_volume_args(&volume_args, &targets, &devices)?;
-        for target in &targets {
-            if target.id == source.id {
-                bail!(
-                    "target '{}' is the loopback source; playing onto the captured \
-                     endpoint would create a feedback loop",
-                    target.name
-                );
-            }
-        }
-        persist_session(source_arg.is_some().then(|| source.id.clone()), &targets);
-        (source, targets)
+        config::Config::default()
     };
+    let (source, targets) = prepare_play_session(
+        source_arg.as_deref(),
+        &target_args,
+        &volume_args,
+        &devices,
+        &saved,
+    )?;
+    if !target_args.is_empty() {
+        persist_session(source_arg.is_some().then(|| source.id.clone()), &targets);
+    }
     println!("Source: {} ({})", source.name, source.mix_format);
     print_targets(&targets);
     engine::run(
@@ -166,14 +163,44 @@ fn cmd_play(
     )
 }
 
+/// Both explicit and restored sessions use the same validation/override
+/// path. An override on a restored session is temporary; explicit targets
+/// retain the existing policy of saving the selected session.
+fn prepare_play_session(
+    source_arg: Option<&str>,
+    target_args: &[String],
+    volume_args: &[String],
+    devices: &[DeviceInfo],
+    saved: &config::Config,
+) -> Result<(DeviceInfo, Vec<engine::Target>)> {
+    let (source, targets) = if target_args.is_empty() {
+        restore_session(source_arg, devices, saved)?
+    } else {
+        let source = resolve_source(source_arg, devices)?.clone();
+        let targets = resolve_targets(target_args, devices)?;
+        for target in &targets {
+            if target.id == source.id {
+                bail!(
+                    "target '{}' is the loopback source; playing onto the captured \
+                     endpoint would create a feedback loop",
+                    target.name
+                );
+            }
+        }
+        (source, targets)
+    };
+    apply_volume_args(volume_args, &targets, devices)?;
+    Ok((source, targets))
+}
+
 /// `play` without --target: rebuild source and targets from the saved
 /// configuration. Stale (unplugged) targets are skipped with a warning but
 /// stay in the config file.
 fn restore_session(
     source_arg: Option<&str>,
     devices: &[DeviceInfo],
+    saved: &config::Config,
 ) -> Result<(DeviceInfo, Vec<engine::Target>)> {
-    let saved = config::load()?;
     if saved.targets.is_empty() {
         bail!(
             "no --target given and no saved configuration found ({}); \
@@ -331,5 +358,68 @@ fn print_targets(targets: &[engine::Target]) {
     println!("Targets:");
     for target in targets {
         println!("  - {} (volume {}%)", target.name, target.volume.percent());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixtures() -> (Vec<DeviceInfo>, config::Config) {
+        let devices = ["source", "target"]
+            .into_iter()
+            .map(|id| DeviceInfo {
+                id: id.into(),
+                name: id.into(),
+                is_default: id == "source",
+                mix_format: devices::MixFormat {
+                    sample_rate: 48000,
+                    channels: 2,
+                    bits_per_sample: 32,
+                    sample_type: devices::SampleType::Float,
+                },
+            })
+            .collect();
+        let saved = config::Config {
+            source: Some("source".into()),
+            targets: vec![config::TargetConfig {
+                id: "target".into(),
+                name: "target".into(),
+                volume: 80,
+                delay_ms: 0,
+            }],
+        };
+        (devices, saved)
+    }
+
+    #[test]
+    fn restored_session_applies_volume_override_without_changing_saved_config() {
+        let (devices, saved) = fixtures();
+        let (_, targets) =
+            prepare_play_session(None, &[], &["target=20".into()], &devices, &saved).unwrap();
+        assert_eq!(targets[0].volume.percent(), 20);
+        assert_eq!(saved.targets[0].volume, 80);
+    }
+
+    #[test]
+    fn restored_session_rejects_invalid_and_non_target_volume_overrides() {
+        let (devices, saved) = fixtures();
+        for arg in ["target=101", "target=wrong", "source=20", "target"] {
+            assert!(
+                prepare_play_session(None, &[], &[arg.into()], &devices, &saved).is_err(),
+                "{arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_and_restored_sessions_apply_the_same_override() {
+        let (devices, saved) = fixtures();
+        for selections in [vec![], vec!["target".into()]] {
+            let (_, targets) =
+                prepare_play_session(None, &selections, &["target=30".into()], &devices, &saved)
+                    .unwrap();
+            assert_eq!(targets[0].volume.percent(), 30);
+        }
     }
 }

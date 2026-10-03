@@ -56,6 +56,11 @@ from the missing behavior visible in the code.
 
 The findings below preserve the original reviewed state.
 
+- R6: explicit and restored CLI sessions now share volume validation and
+  override application. Restored overrides are session-only. Three native
+  unit tests cover valid overrides, invalid/non-target arguments, and both
+  selection modes without accessing audio hardware.
+
 - R5: target reconciliation now adds/removes individual render workers,
   preserving the source, healthy reader positions and volumes. Removed
   workers are retired without joining a live worker in the GUI update;

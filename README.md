@@ -107,6 +107,10 @@ where `<target#>` is the index shown in the status lines.
 config file; `play` without targets restores it (unplugged devices
 are skipped with a warning but stay configured).
 
+`--volume` is validated and applied in both modes. With restored targets
+it overrides the saved volume for this run only; with explicit targets
+the selected session, including initial volumes, is saved as before.
+
 Notes:
 
 - Loopback only delivers audio while something is playing on the
